@@ -239,3 +239,41 @@ def test_distributed_async_update(tmp_path):
         offloaded_1 = cache["tensor_1"]
         assert_tensor_equal(offloaded_0, torch.ones(10) * 1.0, "disk")
         assert_tensor_equal(offloaded_1, torch.ones(10) * 2.0, "disk")
+
+
+@pytest.mark.unit
+@requires_gpu(2)
+@torchrun(world_size=2)
+def test_distributed_concurrent_update(tmp_path):
+    """
+    Test that all ranks can safely update the same tensor concurrently without
+    causing race conditions. This tests the fix for the safetensors "header too small"
+    error that occurs when one rank reads while another writes.
+    """
+    offload_dir = tmp_path / "offload_dir"
+    if dist.get_rank() == 0:
+        os.mkdir(offload_dir)
+
+    # Ensure directory creation completes before other ranks proceed
+    dist.barrier()
+
+    onload_device = torch.accelerator.current_accelerator()
+    cache = DistributedDiskCache(onload_device, offload_dir=str(offload_dir))
+
+    # Initialize tensor in the cache
+    cache["weight"] = torch.zeros(100, device=onload_device)
+
+    # All ranks update the same tensor concurrently with the same value
+    # This tests that update_offload properly synchronizes via barrier
+    for i in range(5):
+        new_value = torch.ones(100, device=onload_device) * float(i + 1)
+        cache["weight"] = new_value
+
+        # Verify all ranks can read the updated value without race conditions
+        read_value = cache["weight"]
+        assert torch.allclose(read_value.cpu(), new_value.cpu())
+
+    # Final verification that offloaded file is correct
+    with disable_onloading():
+        offloaded = cache["weight"]
+        assert_tensor_equal(offloaded, torch.ones(100) * 5.0, "disk")

@@ -49,6 +49,20 @@ class DistributedDiskCache(DiskCache):
         dist.barrier()
         return offloaded
 
+    def update_offload(self, offloaded: torch.Tensor, data: torch.Tensor | None):
+        """
+        Write new param data to file that already exists. Only rank 0 writes,
+        then all ranks wait at barrier to ensure write completes before reads.
+
+        :param offloaded: meta tensors representating parameter to update
+        :param data: new data
+        """
+        if is_source_process():
+            super().update_offload(offloaded, data)
+
+        # wait for write to finish before any rank tries to read
+        dist.barrier()
+
     def __delitem__(self, key: str):
         """
         Remove the offload associated with `key`. If a new file was created to store

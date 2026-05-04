@@ -59,3 +59,17 @@ class DistributedCPUCache(CPUCache):
         dist.barrier()
 
         return tensor
+
+    def update_offload(self, offloaded: torch.Tensor, data: torch.Tensor | None):
+        """
+        Update the offloaded cpu value with new data. Only rank 0 writes to avoid
+        race conditions, then all ranks wait at barrier.
+
+        :param offloaded: cpu tensor in shared memory to update
+        :param data: new data to copy from
+        """
+        if is_source_process():
+            super().update_offload(offloaded, data)
+
+        # wait for write to finish before any rank proceeds
+        dist.barrier()

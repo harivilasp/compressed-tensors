@@ -42,3 +42,17 @@ class DistributedDeviceCache(DeviceCache):
 
         dist.broadcast(as_broadcastable(tensor), src=get_source_rank())
         return tensor
+
+    def update_offload(self, offloaded: torch.Tensor, data: torch.Tensor | None):
+        """
+        Update the offloaded device value with new data, broadcasting from rank 0
+        to all other ranks.
+
+        :param offloaded: device tensor to update
+        :param data: new data to copy from
+        """
+        if is_source_process() and data is not None:
+            super().update_offload(offloaded, data)
+
+        # broadcast the updated data to all ranks
+        dist.broadcast(as_broadcastable(offloaded), src=get_source_rank())

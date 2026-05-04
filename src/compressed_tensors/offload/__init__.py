@@ -115,9 +115,13 @@ def update_offload_parameter(module: torch.nn.Module, name: str, data: torch.Ten
     Update the offload and onload data of an existing parameter/buffer. Supports both
     parameters of both offloaded modules and non-offloaded modules.
 
-    NOTE: This function does not guard against multiple processes writing to offload
-    at the same time. It is the responsibility of the caller to ensure that, for any
-    parameter/buffer, only one rank calls this function at a time.
+    NOTE: When using DistributedDiskCache, DistributedCPUCache, or DistributedDeviceCache,
+    this function is safe to call from all ranks with the same data. Only the source rank
+    will perform the actual write, and a barrier ensures all ranks wait for completion.
+
+    NOTE: For non-distributed caches (DiskCache, CPUCache, DeviceCache), it is the
+    responsibility of the caller to ensure that only one rank calls this function at a
+    time to avoid race conditions.
 
     NOTE: This function does not update onloaded values across ranks. The caller is
     responsible for broadcasting any updates to other ranks, if they are onloaded.
