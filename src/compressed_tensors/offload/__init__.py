@@ -33,7 +33,6 @@ from compressed_tensors.offload.utils import (
 )
 from compressed_tensors.utils.helpers import deprecated, patch_attr
 
-
 __all__ = [
     # dispatch models
     "set_onload_device",
@@ -115,9 +114,10 @@ def update_offload_parameter(module: torch.nn.Module, name: str, data: torch.Ten
     Update the offload and onload data of an existing parameter/buffer. Supports both
     parameters of both offloaded modules and non-offloaded modules.
 
-    NOTE: When using DistributedDiskCache, DistributedCPUCache, or DistributedDeviceCache,
-    this function is safe to call from all ranks with the same data. Only the source rank
-    will perform the actual write, and a barrier ensures all ranks wait for completion.
+    NOTE: For distributed caches (DistributedDiskCache, DistributedCPUCache,
+    DistributedDeviceCache), this function is safe to call from all ranks with the same
+    data. Only the source rank will perform the actual write, and a synchronizing op
+    like torch.distributed.barrier() ensures all ranks wait for completion.
 
     NOTE: For non-distributed caches (DiskCache, CPUCache, DeviceCache), it is the
     responsibility of the caller to ensure that only one rank calls this function at a
