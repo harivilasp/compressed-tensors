@@ -15,5 +15,6 @@ uv --version
 uv venv testvenv --python 3.10
 source testvenv/bin/activate
 
-uv pip install .[dev] --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cu129
+export UV_TORCH_BACKEND=cu130
+uv pip install .[dev] --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cu130
 make test
