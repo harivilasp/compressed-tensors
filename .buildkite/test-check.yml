@@ -7,7 +7,7 @@ steps:
       - kubernetes:
           podSpec:
             nodeSelector:
-              pool: L4duo
+              pool: L4solo
 
             containers:
               - name: tests
@@ -19,7 +19,7 @@ steps:
 
                 resources:
                   limits:
-                    nvidia.com/gpu: 2
+                    nvidia.com/gpu: 1
 
                 volumeMounts:
                   - name: model-cache
