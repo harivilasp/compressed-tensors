@@ -7,7 +7,7 @@ steps:
       - kubernetes:
           podSpec:
             nodeSelector:
-              pool: L4solo
+              pool: L4duo
 
             containers:
               - name: tests
