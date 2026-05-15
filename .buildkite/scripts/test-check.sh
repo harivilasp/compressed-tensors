@@ -16,6 +16,7 @@ uv venv testvenv --python 3.12
 source testvenv/bin/activate
 
 export UV_TORCH_BACKEND=cu130
+export HF_HOME=/model-cache
 uv pip install .[dev] --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cu130
 
 make test

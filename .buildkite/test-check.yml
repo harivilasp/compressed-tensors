@@ -24,7 +24,7 @@ steps:
                 volumeMounts:
                   - name: model-cache
                     mountPath: /model-cache
-                    readOnly: true
+                    readOnly: false
                   - name: dshm
                     mountPath: /dev/shm
 
