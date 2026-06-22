@@ -329,6 +329,6 @@ def print_offload_folder(model: torch.nn.Module, offload_folder: str):
             unknown_paths.append(file_path)
 
     if unknown_paths:
-        print(f"\nUnknown files in offload folder:")
+        print("\nUnknown files in offload folder:")
         for path in unknown_paths:
             print(f"  {path}")
