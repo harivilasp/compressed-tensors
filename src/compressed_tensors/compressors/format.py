@@ -40,7 +40,7 @@ def infer_model_format(
     :param quantization_format: optional global format to override
         the per module formats
     :return: list of formats applied to modules (excluding dense format)
-    """
+    """  # noqa: E501
     formats = set()
 
     for _, module in model.named_modules(remove_duplicate=True):
