@@ -1,20 +1,10 @@
-# Copyright (c) 2021 - present / Neuralmagic, Inc. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
 import torch
 from compressed_tensors.quantization import (
+    FP8_E4M3_DATA,
     QuantizationScheme,
     forward_quantize,
     initialize_module_for_quantization,
@@ -96,6 +86,8 @@ from tests.mock_observer import MockMinMaxObserver
                 symmetric=True,
                 strategy="tensor_group",  # requires float4
                 group_size=3,
+                scale_dtype=FP8_E4M3_DATA.dtype,
+                zp_dtype=FP8_E4M3_DATA.dtype,
             ),
             torch.tensor([[0, 3], [6, 9], [12, 15], [18, 21]]),
             torch.tensor([[2, 5], [8, 11], [14, 17], [20, 23]]),
@@ -206,6 +198,8 @@ def test_static_weight_quantization(
                 strategy="tensor_group",
                 dynamic="local",
                 group_size=3,
+                scale_dtype=FP8_E4M3_DATA.dtype,
+                zp_dtype=FP8_E4M3_DATA.dtype,
             ),
             None,
             None,

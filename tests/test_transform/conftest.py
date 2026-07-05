@@ -1,16 +1,5 @@
-# Copyright (c) 2021 - present / Neuralmagic, Inc. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
 import torch
@@ -62,13 +51,18 @@ class MockAttention(torch.nn.Module):
             num_attention_heads * self.head_dim, hidden_size, bias=False
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, past_key_values=None
+    ) -> torch.Tensor:
         batch_size, seq_len, hidden_size = hidden_states.shape
         hidden_shape = (batch_size, seq_len, -1, self.head_dim)
 
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        if past_key_values is not None:
+            past_key_values.update(key_states, value_states, 0, {})
 
         key_states = self.repeat_kv(key_states, self.num_key_value_groups)
         value_states = self.repeat_kv(value_states, self.num_key_value_groups)
@@ -95,6 +89,21 @@ class MockAttention(torch.nn.Module):
             batch, num_key_value_heads, n_rep, slen, head_dim
         )
         return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+class MockAttentionModel(PreTrainedModel):
+    config_class = PretrainedConfig
+
+    def __init__(self, hidden_size, num_attention_heads, num_key_value_heads):
+        super().__init__(PretrainedConfig())
+        self.self_attn = MockAttention(
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_key_value_heads,
+        )
+
+    def forward(self, x):
+        return self.self_attn(x)
 
 
 @pytest.fixture(scope="function")

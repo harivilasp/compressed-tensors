@@ -1,23 +1,20 @@
-# Copyright (c) 2021 - present / Neuralmagic, Inc. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
-from typing import List, Optional
 
 import torch
 import torch.nn.utils.parametrize as P
 import tqdm
+from compressed_tensors.modeling.attention import (
+    initialize_hooked_attention,
+    register_query_hook,
+)
+from compressed_tensors.modeling.kvcache import (
+    initialize_hooked_kv_cache,
+    register_key_hook,
+)
+from compressed_tensors.offload import OffloadCache
 from compressed_tensors.registry.registry import RegistryMixin, T
 from compressed_tensors.transform import (
     TransformArgs,
@@ -26,8 +23,6 @@ from compressed_tensors.transform import (
 )
 from compressed_tensors.utils import (
     align_module_device,
-    delete_offload_module,
-    has_offloaded_params,
     match_named_modules,
     patch_attr,
     register_offload_module,
@@ -36,6 +31,7 @@ from compressed_tensors.utils import (
 from compressed_tensors.utils.internal import InternalModule
 from torch import Tensor
 from torch.nn import Module, Parameter
+from transformers import PreTrainedModel
 
 
 __all__ = ["TransformFactory", "TransformBase"]
@@ -50,9 +46,9 @@ class TransformFactory(RegistryMixin, ABC):
     :param seed: random seed used to transform weight randomization
     """
 
-    transforms: List["TransformBase"]
+    transforms: list["TransformBase"]
 
-    def __init__(self, name: str, scheme: TransformScheme, seed: Optional[int] = None):
+    def __init__(self, name: str, scheme: TransformScheme, seed: int | None = None):
         self.name = name
         self.scheme = scheme
         self.generator = torch.Generator()
@@ -97,22 +93,16 @@ class TransformFactory(RegistryMixin, ABC):
 
         desc = f"Applying {self.name} transforms"
         for module, arg in tqdm.tqdm(modules_args, desc=desc, disable=(not use_tqdm)):
-            self._apply_to_module(module, arg)
+            self._apply_to_module(model, module, arg)
 
-    def _apply_to_module(self, module: Module, args: TransformArgs):
+    def _apply_to_module(self, model: Module, module: Module, args: TransformArgs):
         """
         Create transforms and apply them to the module
 
+        :param model: model which module belongs to
         :param module: target module to apply transforms to
         :param args: defines how the transform will be applied to the target module
         """
-        if has_offloaded_params(module):
-            if module._hf_hook.place_submodules:
-                raise NotImplementedError(
-                    "Applying transforms to offloaded submodules with "
-                    "`place_submodules=True` is not supported"
-                )
-
         # create transform as submodule
         transform_name = f"{self.name}_{args.location}"
         transform = self.create_transform(module, args)
@@ -137,16 +127,27 @@ class TransformFactory(RegistryMixin, ABC):
             with torch.no_grad(), align_module_device(module):
                 update_offload_parameter(module, "weight", transform(module.weight))
 
+                # For WEIGHT_OUTPUT, the bias must also be transformed:
+                #   y' = R @ (W @ x + b) = (R @ W) @ x + R @ b
+                # Without this, models with bias (e.g. Qwen2 attention)
+                # produce incorrect outputs under head-wise rotations (R2).
+                if (
+                    args.location == TransformLocation.WEIGHT_OUTPUT
+                    and getattr(module, "bias", None) is not None
+                ):
+                    new_bias = transform(module.bias.unsqueeze(-1)).squeeze(-1)
+                    update_offload_parameter(module, "bias", new_bias)
+
             if self.scheme.requires_grad:
                 # for training, the weight changes with every forward pass
                 # so we can leverage parametrization to propagate the gradient
-                if has_offloaded_params(module):
+                if isinstance(module._parameters, OffloadCache):
                     raise ValueError("Offloaded training is not supported")
                 P.register_parametrization(module, "weight", transform)
 
             else:
                 # transform is no longer needed (unfusing is not supported)
-                delete_offload_module(module, transform_name)
+                delattr(module, transform_name)
 
         # register output transformation hook
         elif args.location == TransformLocation.OUTPUT:
@@ -156,7 +157,28 @@ class TransformFactory(RegistryMixin, ABC):
 
             module.register_forward_hook(output_hook)
 
-        # other locations such as q_attn and k_attn have not been implemented
+        # register query hook to attention
+        elif args.location == TransformLocation.Q_ATTN:
+            if not isinstance(model, PreTrainedModel):
+                raise ValueError(f"Cannot hook attention of model: {model}")
+
+            def query_hook(_, query_states):
+                return transform(query_states)
+
+            initialize_hooked_attention(model, module)
+            register_query_hook(module, query_hook)
+
+        # register key hook to kvcache
+        elif args.location == TransformLocation.K_CACHE:
+            if not isinstance(model, PreTrainedModel):
+                raise ValueError(f"Cannot hook attention of model: {model}")
+
+            def key_hook(_, key_states):
+                return transform(key_states)
+
+            initialize_hooked_kv_cache(model, module)
+            register_key_hook(module, key_hook)
+
         else:
             raise NotImplementedError()
 
@@ -168,7 +190,7 @@ class TransformBase(InternalModule, ABC):
 
     args: TransformArgs
     weight: Parameter
-    _dynamic_tied_weights_keys: List[str] = ["weight"]
+    _dynamic_tied_weights_keys: list[str] = ["weight"]
 
     @abstractmethod
     def forward(self, value: Tensor) -> Tensor:

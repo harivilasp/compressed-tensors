@@ -1,31 +1,25 @@
-# Copyright (c) 2021 - present / Neuralmagic, Inc. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from unittest.mock import patch
 
 import pytest
+import torch
 import torch.nn as nn
 
 # Assuming the module is named "module_matching" - adjust import as needed
 from compressed_tensors.utils import (
     InternalModule,
+    get_lowest_common_ancestor_name,
     is_match,
+    is_narrow_match,
     match_modules_set,
+    match_name,
     match_named_modules,
     match_named_parameters,
+    match_quantizable_tensors,
 )
-from compressed_tensors.utils.match import _match_class, _match_name
+from compressed_tensors.utils.match import _match_class
 from transformers import AutoModelForCausalLM
 
 
@@ -41,77 +35,104 @@ class DummyModel(nn.Module):
     """Test model for unit tests. Weights are initialized on meta device"""
 
     def __init__(self):
-        try:
-            from accelerate import init_empty_weights
-        except ImportError:
-            pytest.skip("Skipping weight init requires accelerate")
-
         super().__init__()
-        with init_empty_weights():
-            self.layer1 = nn.Linear(10, 20)
-            self.layer2 = nn.Linear(20, 30)
-            self.norm = nn.LayerNorm(30)
-            self.attention = nn.MultiheadAttention(30, 2)
+        self.layer1 = nn.Linear(10, 20)
+        self.layer2 = nn.Linear(20, 30)
+        self.norm = nn.LayerNorm(30)
+        self.attention = nn.MultiheadAttention(30, 2)
 
-            # Create nested structure
-            self.transformer = nn.ModuleDict(
-                {
-                    "layers": nn.ModuleList(
-                        [
-                            nn.ModuleDict(
-                                {
-                                    "self_attn": nn.ModuleDict(
-                                        {
-                                            "q_proj": nn.Linear(30, 30),
-                                            "k_proj": nn.Linear(30, 30),
-                                            "v_proj": nn.Linear(30, 30),
-                                        }
-                                    ),
-                                    "norm": nn.LayerNorm(30),
-                                    "mlp": nn.Linear(30, 30),
-                                }
-                            )
-                            for _ in range(3)
-                        ]
-                    )
-                }
-            )
+        # Create nested structure
+        self.transformer = nn.ModuleDict(
+            {
+                "layers": nn.ModuleList(
+                    [
+                        nn.ModuleDict(
+                            {
+                                "self_attn": nn.ModuleDict(
+                                    {
+                                        "q_proj": nn.Linear(30, 30),
+                                        "k_proj": nn.Linear(30, 30),
+                                        "v_proj": nn.Linear(30, 30),
+                                    }
+                                ),
+                                "norm": nn.LayerNorm(30),
+                                "mlp": nn.Linear(30, 30),
+                            }
+                        )
+                        for _ in range(3)
+                    ]
+                )
+            }
+        )
+
+
+class DummyMoEModel(nn.Module):
+    """Test MoE model for unit tests. Weights are initialized on meta device"""
+
+    def __init__(self, num_layers=2, num_experts=4):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [
+                nn.ModuleDict(
+                    {
+                        "post_attention_layernorm": nn.LayerNorm(3),
+                        "mlp": nn.ModuleDict(
+                            {
+                                "experts": nn.ModuleList(
+                                    [
+                                        nn.ModuleDict(
+                                            {
+                                                "gate_proj": nn.Linear(3, 6),
+                                                "up_proj": nn.Linear(3, 6),
+                                                "down_proj": nn.Linear(6, 3),
+                                            }
+                                        )
+                                        for _ in range(num_experts)
+                                    ]
+                                ),
+                            }
+                        ),
+                    }
+                )
+                for _ in range(num_layers)
+            ]
+        )
 
 
 class TestMatchName:
-    """Test cases for _match_name function"""
+    """Test cases for match_name function"""
 
     def test_exact_match(self):
         """Test exact string matching"""
-        assert _match_name("layer1", "layer1")
-        assert not _match_name("layer1", "layer2")
-        assert _match_name(
+        assert match_name("layer1", "layer1")
+        assert not match_name("layer1", "layer2")
+        assert match_name(
             "transformer.layers.0.self_attn.q_proj",
             "transformer.layers.0.self_attn.q_proj",
         )
 
     def test_regex_match(self):
         """Test regex matching with "re:" prefix"""
-        assert _match_name("layer1", "re:layer.*")
-        assert _match_name("layer1", "re:^layer1$")
-        assert not _match_name("layer1", "re:layer2")
-        assert _match_name("transformer.layers.0.self_attn.q_proj", "re:.*q_proj")
-        assert _match_name(
+        assert match_name("layer1", "re:layer.*")
+        assert match_name("layer1", "re:^layer1$")
+        assert not match_name("layer1", "re:layer2")
+        assert match_name("transformer.layers.0.self_attn.q_proj", "re:.*q_proj")
+        assert match_name(
             "transformer.layers.0.self_attn.q_proj",
             "re:transformer\\.layers\\.\\d+\\.self_attn\\..*_proj$",
         )
 
     def test_empty_strings(self):
         """Test edge cases with empty strings"""
-        assert _match_name("", "")
-        assert not _match_name("layer1", "")
-        assert not _match_name("", "layer1")
+        assert match_name("", "")
+        assert not match_name("layer1", "")
+        assert not match_name("", "layer1")
 
     def test_regex_special_characters(self):
         """Test regex with special characters"""
-        assert _match_name("layer.1", "re:layer\\.1")
-        assert _match_name("layer.1", "re:layer.1")  # . matches any char
-        assert _match_name("layer_1", "re:layer_1")
+        assert match_name("layer.1", "re:layer\\.1")
+        assert match_name("layer.1", "re:layer.1")  # . matches any char
+        assert match_name("layer_1", "re:layer_1")
 
 
 class TestMatchClass:
@@ -411,6 +432,58 @@ class TestMatchNamedParameters:
         assert len(matches) == 0
 
 
+class TestGetLowestCommonModuleName:
+    """Test cases for get_lowest_common_ancestor_name function"""
+
+    def test_multiple_modules(self):
+        assert "abc" == get_lowest_common_ancestor_name(
+            [
+                "abc.a",
+                "abc.b",
+                "abc.c",
+            ]
+        )
+
+    def test_single_module(self):
+        assert "abc.abc" == get_lowest_common_ancestor_name(
+            [
+                "abc.abc",
+            ]
+        )
+
+    def test_substring_modules(self):
+        assert "abc" == get_lowest_common_ancestor_name(
+            [
+                "abc.abc",
+                "abc.ab",
+            ]
+        )
+
+    def test_parent_and_child_modules(self):
+        assert "abc.abc" == get_lowest_common_ancestor_name(
+            [
+                "abc.abc.ab",
+                "abc.abc",
+            ]
+        )
+
+    def test_root(self):
+        assert "" == get_lowest_common_ancestor_name(
+            [
+                "abc.abc",
+                "b.abc",
+            ]
+        )
+
+    def test_ignore_none(self):
+        assert "abc.abc" == get_lowest_common_ancestor_name(
+            [
+                "abc.abc",
+                None,
+            ]
+        )
+
+
 class TestMatchModulesSet:
     """Test cases for match_modules_set function"""
 
@@ -431,7 +504,71 @@ class TestMatchModulesSet:
         # Each set should have 3 modules
         for module_set in matches:
             assert len(module_set) == 3
-            assert all(isinstance(m, nn.Linear) for m in module_set)
+            assert all(isinstance(*m, nn.Linear) for m in module_set)
+
+    def test_moe_module_match(self):
+        """Test matching MoE modules with multiple experts per layer"""
+        model = DummyMoEModel(num_layers=2, num_experts=4)
+
+        # Test matching expert projections - each expert becomes its own set
+        # because the parent context differs between experts
+        targets = [
+            "re:.*gate_proj$",
+            "re:.*up_proj$",
+        ]
+
+        matches = list(match_modules_set(model, targets))
+
+        # Should have 8 sets (2 layers * 4 experts)
+        assert len(matches) == 8
+
+        # Each set should have 2 target lists (gate_proj, up_proj)
+        for expert_group in matches:
+            assert len(expert_group) == 2
+            gate_modules, up_modules = expert_group
+
+            # Each target should have matched 1 module (single expert)
+            assert len(gate_modules) == 1
+            assert len(up_modules) == 1
+
+            # All modules should be Linear layers
+            assert isinstance(gate_modules[0], nn.Linear)
+            assert isinstance(up_modules[0], nn.Linear)
+
+    def test_moe_with_layernorm_match(self):
+        """
+        Test matching MoE modules with their corresponding layer norms.
+        Including a layer-level module (layernorm) groups all experts in
+        that layer together.
+        """
+        model = DummyMoEModel(num_layers=2, num_experts=3)
+
+        # Match layer norm with expert projections - the layernorm is at layer level,
+        # so it establishes a common parent context for all experts in that layer
+        targets = [
+            "re:.*post_attention_layernorm$",
+            "re:.*gate_proj$",
+            "re:.*up_proj$",
+        ]
+
+        matches = list(match_modules_set(model, targets))
+
+        # Should have 2 layer groups (one per layer)
+        assert len(matches) == 2
+
+        for layer_group in matches:
+            assert len(layer_group) == 3
+            norm_modules, gate_modules, up_modules = layer_group
+
+            # LayerNorm should have 1 module (single per layer)
+            assert len(norm_modules) == 1
+            assert isinstance(norm_modules[0], nn.LayerNorm)
+
+            # Each projection should have 3 experts (all experts in the layer)
+            assert len(gate_modules) == 3
+            assert len(up_modules) == 3
+            assert all(isinstance(m, nn.Linear) for m in gate_modules)
+            assert all(isinstance(m, nn.Linear) for m in up_modules)
 
     def test_module_set_ordering(self):
         """Test that module sets maintain target ordering"""
@@ -447,6 +584,7 @@ class TestMatchModulesSet:
         for module_set in matches:
             # Check that modules are returned in target order (v, q, k)
             v_proj, q_proj, k_proj = module_set
+            v_proj, q_proj, k_proj = *v_proj, *q_proj, *k_proj
             # We can't easily check the exact modules, but can check they're all Linear
             assert all(isinstance(m, nn.Linear) for m in [v_proj, q_proj, k_proj])
 
@@ -455,18 +593,8 @@ class TestMatchModulesSet:
         model = DummyModel()
         targets = ["layer1", "nonexistent_module"]
 
-        with pytest.raises(ValueError, match="Unable to match targets into set"):
-            list(match_modules_set(model, targets))
-
-    def test_duplicate_match_error(self):
-        """Test error when same target matches multiple times before set completion"""
-        model = DummyModel()
-        # This should cause the same target to match multiple times
-        # before we can complete a set
-        targets = ["Linear", "Linear"]  # Two identical targets
-
         with pytest.raises(
-            ValueError, match="Matched a .* twice before completing set"
+            ValueError, match="Found a final incomplete set with matches found for keys"
         ):
             list(match_modules_set(model, targets))
 
@@ -498,6 +626,86 @@ class TestMatchModulesSet:
         linear = InternalLinear(10, 20)
         matches = list(match_modules_set(linear, ["re:.*"]))
         assert len(matches) == 0
+
+
+class TestIsNarrowMatch:
+    def test_narrow_match_true_child_only(self):
+        """
+        Target matches the child module name but NOT its parent name.
+        Should return True.
+        """
+        model = DummyModel()
+        name = "transformer.layers.0.self_attn.q_proj"
+        # Matches "...q_proj" but not "...self_attn"
+        target = r"re:.*q_proj$"
+
+        assert is_narrow_match(model, target, name)
+
+    def test_narrow_match_false_when_parent_also_matches(self):
+        """
+        Target matches both the child and its parent name.
+        Should return False because it's not a 'narrow' match.
+        """
+        model = DummyModel()
+        name = "transformer.layers.0.self_attn.q_proj"
+        # Broad target that also matches the parent "transformer.layers.0.self_attn"
+        target = r"re:transformer\.layers\.0\..*"
+
+        assert not is_narrow_match(model, target, name)
+
+    def test_narrow_match_false_when_neither_matches(self):
+        """
+        Target matches neither the child nor the parent.
+        Should return False.
+        """
+        model = DummyModel()
+        name = "transformer.layers.0.self_attn.q_proj"
+        target = r"re:this_does_not_exist$"
+
+        assert not is_narrow_match(model, target, name)
+
+    def test_narrow_match_iterable_targets_any_true(self):
+        """
+        With multiple targets: if any target narrowly matches the child,
+        the function should return True.
+        """
+        model = DummyModel()
+        name = "transformer.layers.0.self_attn.q_proj"
+        # First target is broad (matches both child & parent -> narrow False),
+        # second target is narrow (matches child only -> narrow True).
+        targets = [
+            r"re:transformer\.layers\.0\..*",
+            r"re:.*q_proj$",
+        ]
+
+        assert is_narrow_match(model, targets, name)
+
+    def test_narrow_match_with_explicit_module_argument(self):
+        """
+        Passing the module explicitly should behave the same as when it's
+        retrieved from the model by name.
+        """
+        model = DummyModel()
+        name = "transformer.layers.0.self_attn.q_proj"
+        module = model.get_submodule(name)
+        target = r"re:.*q_proj$"
+
+        # Both ways should be True
+        assert is_narrow_match(model, target, name)
+        assert is_narrow_match(model, target, name, module=module)
+
+    def test_narrow_match_top_level_behavior_documented(self):
+        """
+        (Behavior check) For a top-level module name without a dot, the current
+        implementation derives parent_name == name, so parent==child.
+        Then 'narrow' cannot be True because parent match mirrors child match.
+        This test documents current behavior to guard against regressions.
+        """
+        model = DummyModel()
+        name = "layer1"  # top-level module in DummyModel
+        target = r"re:^layer1$"
+
+        assert not is_narrow_match(model, target, name)
 
 
 class TestIntegration:
@@ -546,3 +754,201 @@ class TestIntegration:
         # Basic sanity checks
         assert isinstance(modules, list)
         assert isinstance(params, list)
+
+
+@pytest.fixture
+def sample_tensors():
+    """Create a sample set of tensors mimicking a model's state dict."""
+    return {
+        "model.layers.0.self_attn.q_proj.weight": torch.randn(128, 128),
+        "model.layers.0.self_attn.k_proj.weight": torch.randn(128, 128),
+        "model.layers.0.self_attn.v_proj.weight": torch.randn(128, 128),
+        "model.layers.0.mlp.gate_proj.weight": torch.randn(256, 128),
+        "model.layers.0.mlp.up_proj.weight": torch.randn(256, 128),
+        "model.layers.0.mlp.down_proj.weight": torch.randn(128, 256),
+        "model.layers.0.input_layernorm.weight": torch.randn(128),
+        "model.layers.0.post_attention_layernorm.weight": torch.randn(128),
+        "model.embed_tokens.weight": torch.randn(32000, 128),
+        "lm_head.weight": torch.randn(32000, 128),
+        "model.layers.0.self_attn.q_proj.bias": torch.randn(128),
+    }
+
+
+@pytest.mark.parametrize(
+    "ignore,targets,param_targets,allow_nonquantizable,expected_names",
+    [
+        # Test case: basic matching without ignore or targets
+        (
+            [],
+            [],
+            ("weight",),
+            False,
+            {
+                "model.layers.0.self_attn.q_proj.weight",
+                "model.layers.0.self_attn.k_proj.weight",
+                "model.layers.0.self_attn.v_proj.weight",
+                "model.layers.0.mlp.gate_proj.weight",
+                "model.layers.0.mlp.up_proj.weight",
+                "model.layers.0.mlp.down_proj.weight",
+                "model.embed_tokens.weight",
+                "lm_head.weight",
+            },
+        ),
+        # Test case: ignore attention layers
+        (
+            ["re:.*self_attn.*"],
+            [],
+            ("weight",),
+            False,
+            {
+                "model.layers.0.mlp.gate_proj.weight",
+                "model.layers.0.mlp.up_proj.weight",
+                "model.layers.0.mlp.down_proj.weight",
+                "model.embed_tokens.weight",
+                "lm_head.weight",
+            },
+        ),
+        # Test case: ignore attention and mlp layers
+        (
+            ["re:.*self_attn.*", "re:.*mlp.*"],
+            [],
+            ("weight",),
+            False,
+            {
+                "model.embed_tokens.weight",
+                "lm_head.weight",
+            },
+        ),
+        # Test case: target only mlp gate_proj and up_proj
+        (
+            [],
+            ["re:.*mlp.*gate_proj", "re:.*mlp.*up_proj"],
+            ("weight",),
+            False,
+            {
+                "model.layers.0.mlp.gate_proj.weight",
+                "model.layers.0.mlp.up_proj.weight",
+            },
+        ),
+        # Test case: empty targets (all-inclusive)
+        (
+            [],
+            [],
+            ("weight",),
+            False,
+            {
+                "model.layers.0.self_attn.q_proj.weight",
+                "model.layers.0.self_attn.k_proj.weight",
+                "model.layers.0.self_attn.v_proj.weight",
+                "model.layers.0.mlp.gate_proj.weight",
+                "model.layers.0.mlp.up_proj.weight",
+                "model.layers.0.mlp.down_proj.weight",
+                "model.embed_tokens.weight",
+                "lm_head.weight",
+            },
+        ),
+        # Test case: Linear targets (all-inclusive)
+        (
+            [],
+            ["Linear"],
+            ("weight",),
+            False,
+            {
+                "model.layers.0.self_attn.q_proj.weight",
+                "model.layers.0.self_attn.k_proj.weight",
+                "model.layers.0.self_attn.v_proj.weight",
+                "model.layers.0.mlp.gate_proj.weight",
+                "model.layers.0.mlp.up_proj.weight",
+                "model.layers.0.mlp.down_proj.weight",
+                "model.embed_tokens.weight",
+                "lm_head.weight",
+            },
+        ),
+        # Test case: allow_nonquantizable includes bias and layernorm
+        (
+            [],
+            [],
+            ("weight", "bias"),
+            True,
+            {
+                "model.layers.0.self_attn.q_proj.weight",
+                "model.layers.0.self_attn.k_proj.weight",
+                "model.layers.0.self_attn.v_proj.weight",
+                "model.layers.0.mlp.gate_proj.weight",
+                "model.layers.0.mlp.up_proj.weight",
+                "model.layers.0.mlp.down_proj.weight",
+                "model.layers.0.input_layernorm.weight",
+                "model.layers.0.post_attention_layernorm.weight",
+                "model.embed_tokens.weight",
+                "lm_head.weight",
+                "model.layers.0.self_attn.q_proj.bias",
+            },
+        ),
+        # Test case: ignore takes precedence over targets
+        (
+            ["re:.*self_attn.*"],
+            ["re:.*self_attn.*q_proj"],
+            ("weight",),
+            False,
+            set(),
+        ),
+        # Test case: regex pattern matching all proj layers
+        (
+            [],
+            ["re:.*proj$"],
+            ("weight",),
+            False,
+            {
+                "model.layers.0.self_attn.q_proj.weight",
+                "model.layers.0.self_attn.k_proj.weight",
+                "model.layers.0.self_attn.v_proj.weight",
+                "model.layers.0.mlp.gate_proj.weight",
+                "model.layers.0.mlp.up_proj.weight",
+                "model.layers.0.mlp.down_proj.weight",
+            },
+        ),
+    ],
+    ids=[
+        "basic_matching",
+        "ignore_attention",
+        "ignore_attention_and_mlp",
+        "target_mlp_gate_up",
+        "empty_targets",
+        "linear_targets",
+        "allow_nonquantizable",
+        "ignore_precedence",
+        "regex_all_proj",
+    ],
+)
+def test_match_quantizable_tensors(
+    sample_tensors, ignore, targets, param_targets, allow_nonquantizable, expected_names
+):
+    """
+    Parameterized test for match_quantizable_tensors function.
+
+    Tests various combinations of ignore patterns, target patterns, and flags
+    to verify that the function returns the expected set of tensor names.
+    """
+    matches = list(
+        match_quantizable_tensors(
+            sample_tensors,
+            ignore=ignore,
+            targets=targets,
+            param_targets=param_targets,
+            allow_nonquantizable=allow_nonquantizable,
+        )
+    )
+
+    # Extract full names from results
+    result_names = {full_name for _, full_name in matches}
+
+    # Assert the result matches expected
+    assert result_names == expected_names
+
+    # Additionally verify all results are tuples with correct format
+    for module_name, full_name in matches:
+        assert isinstance(module_name, str)
+        assert isinstance(full_name, str)
+        # module_name should be full_name without the last component
+        assert full_name.startswith(module_name)
+        assert full_name.rsplit(".", 1)[0] == module_name

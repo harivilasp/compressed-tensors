@@ -1,20 +1,8 @@
-# Copyright (c) 2021 - present / Neuralmagic, Inc. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
 import math
-from typing import Generator, List, Optional, Tuple
 
 import torch
 from compressed_tensors.quantization.quant_args import (
@@ -24,9 +12,13 @@ from compressed_tensors.quantization.quant_args import (
     QuantizationArgs,
     QuantizationStrategy,
     QuantizationType,
+    round_to_quantized_type_dtype,
 )
-from compressed_tensors.quantization.quant_scheme import QuantizationScheme
-from compressed_tensors.utils import deprecated
+from compressed_tensors.quantization.utils.mxfp_utils import (
+    generate_mx_scales,
+    maybe_convert_from_mx_exp,
+    should_generate_mx_scales,
+)
 from loguru import logger
 from torch import FloatTensor, IntTensor, Tensor
 from torch.nn import Module
@@ -38,39 +30,29 @@ __all__ = [
     "module_type",
     "get_torch_bit_depth",
     "can_quantize",
-    "parse_out_kv_cache_args",
     "KV_CACHE_TARGETS",
-    "is_kv_cache_quant_scheme",
-    "iter_named_leaf_modules",
-    "iter_named_quantizable_modules",
     "compute_dynamic_scales_and_zp",
     "calculate_range",
     "calculate_qparams",
     "generate_gparam",
-    "is_fp4",
     "strategy_cdiv",
+    "calculate_block_padding",
+    "maybe_pad_tensor_for_block_quant",
 ]
 
 # target the self_attn layer
 # QuantizedKVParameterCache is responsible for obtaining the k_scale and v_scale
-KV_CACHE_TARGETS = ["re:.*self_attn$"]
+KV_CACHE_TARGETS = ["re:.*(self_attn|attention)$"]
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
-
-
-def is_fp4(quantization_args: QuantizationArgs):
-    return (
-        quantization_args.num_bits == 4
-        and quantization_args.type == QuantizationType.FLOAT
-    )
 
 
 def calculate_qparams(
     min_vals: Tensor,
     max_vals: Tensor,
     quantization_args: QuantizationArgs,
-    global_scale: Optional[Tensor] = None,
-) -> Tuple[FloatTensor, IntTensor]:
+    global_scale: Tensor | None = None,
+) -> tuple[FloatTensor, IntTensor]:
     """
     :param min_vals: tensor of min value(s) to calculate scale(s) and zero point(s)
         from
@@ -93,52 +75,60 @@ def calculate_qparams(
     bit_min, bit_max = calculate_range(quantization_args, device)
     bit_range = bit_max - bit_min
 
-    if is_fp4(quantization_args=quantization_args):
-        zp_dtype = FP8_E4M3_DATA.dtype
-    else:
-        zp_dtype = quantization_args.pytorch_dtype()
-
+    # 1. Generate scale and zero-point
     if quantization_args.symmetric:
         max_val_pos = torch.max(torch.abs(min_vals), torch.abs(max_vals))
-
-        if is_fp4(quantization_args=quantization_args) and global_scale is not None:
-            # Conditionally scale the generated local scale by a global_scale
-            scales = global_scale * (max_val_pos / FP4_E2M1_DATA.max)
-            scales = torch.clamp(scales, max=FP8_E4M3_DATA.max, min=FP8_E4M3_DATA.min)
-            scales = scales.to(FP8_E4M3_DATA.dtype)
-
-        else:
-            scales = max_val_pos / (float(bit_range) / 2)
-
-        # TODO: in the case of MoEs, the global_scale may also be 0/need to be clamped
-        if scales.dtype == FP8_E4M3_DATA.dtype:
-            # torch.clamp not supported for FP8
-            # use the next largest fp8 value from 0
-            scales = torch.where(
-                scales == 0,
-                torch.tensor(0.125, dtype=FP8_E4M3_DATA.dtype, device=device),
-                scales,
+        if should_generate_mx_scales(args=quantization_args):
+            scales = generate_mx_scales(
+                x=max_val_pos, num_bits=quantization_args.num_bits
             )
         else:
-            scales = torch.clamp(scales, min=torch.finfo(torch.float32).eps)
-
+            scales = max_val_pos / (float(bit_range) / 2)
         zero_points = torch.zeros(scales.shape, device=device, dtype=min_vals.dtype)
     else:
-        if is_fp4(quantization_args=quantization_args):
+        if (
+            quantization_args.num_bits == 4
+            and quantization_args.type == QuantizationType.FLOAT
+        ):
             raise NotImplementedError(
                 "Asymmetric Quantization is not supported for FP4"
             )
-
         scales = (max_vals - min_vals) / float(bit_range)
-        scales = torch.clamp(scales, min=torch.finfo(torch.float32).eps)
         zero_points = bit_min - (min_vals / scales)
         zero_points = torch.clamp(zero_points, bit_min, bit_max)
 
-    # match zero-points to quantized type
-    # if casting to int, use round instead of truncate
-    if quantization_args.type == QuantizationType.INT:
-        zero_points = torch.round(zero_points)
-    zero_points = zero_points.to(zp_dtype)
+    # 2. Conditionally scale the generated local scale by a global_scale
+    if global_scale is not None:
+        scales = global_scale * scales
+
+    # 3. Conditionally round the scale to the quantized dtype, if scale_dtype is set
+    if quantization_args.scale_dtype is not None:
+        scales = round_to_quantized_type_dtype(
+            scales, dtype=quantization_args.scale_dtype
+        )
+
+    # 4. Optionally remove exponent
+    scales = maybe_convert_from_mx_exp(quantization_args, scales)
+
+    # 5. Update any 0s with small values to
+    # prevent div by 0
+    eps = _get_dtype_eps(
+        dtype=(
+            quantization_args.scale_dtype
+            if quantization_args.scale_dtype is not None
+            else scales.dtype
+        )
+    )
+    scales = torch.where(
+        scales == 0,
+        torch.tensor(eps, dtype=scales.dtype, device=device),
+        scales,
+    )
+
+    # 6. Round the zp to zp_dtype
+    zero_points = round_to_quantized_type_dtype(
+        zero_points, dtype=quantization_args.zp_dtype, cast_to_original_dtype=False
+    )
 
     if scales.ndim == 0:
         scales = scales.reshape(1)
@@ -151,7 +141,7 @@ def compute_dynamic_scales_and_zp(
     value: Tensor,
     args: QuantizationArgs,
     module: torch.nn.Module,
-    global_scale: Optional[Tensor] = None,
+    global_scale: Tensor | None = None,
 ):
     """
     Returns the computed scales and zero points for dynamic activation
@@ -206,7 +196,9 @@ def compute_dynamic_scales_and_zp(
     return calculate_qparams(min_val, max_val, args, global_scale=global_scale)
 
 
-def calculate_range(quantization_args: QuantizationArgs, device: str) -> Tuple:
+def calculate_range(
+    quantization_args: QuantizationArgs, device: str
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Calculated the effective quantization range for the given Quantization Args
 
@@ -215,7 +207,7 @@ def calculate_range(quantization_args: QuantizationArgs, device: str) -> Tuple:
     :return: tuple endpoints for the given quantization range
     """
     if quantization_args.type == QuantizationType.INT:
-        bit_range = 2**quantization_args.num_bits
+        bit_range = 2.0**quantization_args.num_bits
         q_max = torch.tensor(bit_range / 2 - 1, device=device)
         q_min = torch.tensor(-bit_range / 2, device=device)
     elif quantization_args.type == QuantizationType.FLOAT:
@@ -279,83 +271,6 @@ def module_type(module: Module) -> str:
     return type(module).__name__
 
 
-@deprecated(
-    message="This function will be removed in a future release. "
-    "Please use `model.named_modules()` and filter by "
-    "compressed_tensors.InternalModule if neceessary"
-)
-def iter_named_leaf_modules(model: Module) -> Generator[Tuple[str, Module], None, None]:
-    """
-    Yields modules that do not have any submodules except observers. The observers
-    themselves are not yielded
-    :param model: model to get leaf modules of
-    :returns: generator tuple of (name, leaf_submodule)
-    """
-    for name, submodule in model.named_modules():
-        children = list(submodule.children())
-        # TODO: verify if an observer would ever be attached in this case/remove check
-        if len(children) == 0 and "observer" in name:
-            yield name, submodule
-        else:
-            if len(children) > 0:
-                named_children, children = zip(*list(submodule.named_children()))
-            has_non_observer_children = False
-            for i in range(len(children)):
-                child_name = named_children[i]
-
-                if "observer" not in child_name:
-                    has_non_observer_children = True
-
-            if not has_non_observer_children:
-                yield name, submodule
-
-
-@deprecated(
-    message="This function will be removed in a future release. "
-    "Please use `model.named_modules()` and filter by "
-    "compressed_tensors.InternalModule if neceessary"
-)
-def iter_named_quantizable_modules(
-    model: Module,
-    include_children: bool = True,
-    include_attn: bool = False,
-    include_mlp: bool = False,
-) -> Generator[Tuple[str, Module], None, None]:
-    """
-    Yield name and submodule of
-    - leaf modules, set by include_children
-    - attention modyles, set by include_attn
-    :param model: model to get leaf modules of
-    :param include_children: flag to get the leaf modules
-    :param inlcude_attn: flag to get the attention modules
-    :returns: generator tuple of (name, submodule)
-    """
-    for name, submodule in model.named_modules():
-        # TODO: verify if an observer would ever be attached in this case/remove check
-        if include_children:
-            children = list(submodule.children())
-            if len(children) == 0 and "observer" not in name:
-                yield name, submodule
-            else:
-                if len(children) > 0:
-                    named_children, children = zip(*list(submodule.named_children()))
-                has_non_observer_children = False
-                for i in range(len(children)):
-                    child_name = named_children[i]
-
-                    if "observer" not in child_name:
-                        has_non_observer_children = True
-
-                if not has_non_observer_children:
-                    yield name, submodule
-        if include_attn:
-            if name.endswith("self_attn"):
-                yield name, submodule
-        if include_mlp:
-            if name.endswith("mlp"):
-                yield name, submodule
-
-
 def get_torch_bit_depth(value: torch.Tensor) -> int:
     """
     Determine the number of bits used to represent the dtype of a tensor
@@ -391,63 +306,12 @@ def can_quantize(value: torch.Tensor, quant_args: "QuantizationArgs") -> bool:  
     return bit_depth > quant_args.num_bits
 
 
-def is_kv_cache_quant_scheme(scheme: QuantizationScheme) -> bool:
-    """
-    Check whether the QuantizationScheme targets the kv cache.
-    It does if all the following criteria are met:
-    - the scheme targets either exactly match the KV_CACHE_TARGETS
-        or the match KV_CACHE_TARGETS regex pattern
-    - the scheme quantizes output_activations (we want to quantize the
-        outputs from the KV_CACHE_TARGETS, as their correspond to the
-        keys and values that are to be saved in the cache)
-
-    :param scheme: The QuantizationScheme to investigate
-    :return: boolean flag
-    """
-    for target in scheme.targets:
-        if target in KV_CACHE_TARGETS:
-            return True
-
-    return False
-
-
-def parse_out_kv_cache_args(
-    quant_scheme_to_layers: List[QuantizationScheme],
-) -> Tuple[Optional[QuantizationArgs], List[QuantizationScheme]]:
-    """
-    If possible, parse out the kv cache specific QuantizationArgs
-    from the list of the QuantizationSchemes. If no kv cache
-    specific QuantizationArgs available, this function acts
-    as an identity function
-
-    :param quant_scheme_to_layers: list of QuantizationSchemes
-    :return: kv_cache_args (optional) and the (remaining or original)
-        list of the QuantizationSchemes
-    """
-    kv_cache_quant_scheme_to_layers = [
-        scheme for scheme in quant_scheme_to_layers if is_kv_cache_quant_scheme(scheme)
-    ]
-    quant_scheme_to_layers = [
-        scheme
-        for scheme in quant_scheme_to_layers
-        if not is_kv_cache_quant_scheme(scheme)
-    ]
-
-    if kv_cache_quant_scheme_to_layers:
-        kv_cache_quant_scheme_to_layers = kv_cache_quant_scheme_to_layers[0]
-        kv_cache_args = kv_cache_quant_scheme_to_layers.output_activations
-    else:
-        kv_cache_args = None
-
-    return kv_cache_args, quant_scheme_to_layers
-
-
 def generate_gparam(
     updated_min_val: torch.Tensor,
     updated_max_val: torch.Tensor,
-    scale_data: Optional[FloatArgs] = FP8_E4M3_DATA,
-    quant_data: Optional[FloatArgs] = FP4_E2M1_DATA,
-    dtype: Optional[torch.dtype] = torch.float32,
+    scale_data: FloatArgs | None = FP8_E4M3_DATA,
+    quant_data: FloatArgs | None = FP4_E2M1_DATA,
+    dtype: torch.dtype | None = torch.float32,
 ):
     """
     Generate a global scale for an entire tensor (input_tensor).
@@ -461,14 +325,23 @@ def generate_gparam(
     min_vals = torch.min(updated_min_val, torch.zeros_like(updated_min_val))
     max_vals = torch.max(updated_max_val, torch.zeros_like(updated_max_val))
     max_val_pos = torch.max(torch.abs(min_vals), torch.abs(max_vals))
+    max_val_pos = torch.clamp(max_val_pos, min=torch.finfo(max_val_pos.dtype).tiny)
     global_scale = scale_data.max * quant_data.max / max_val_pos
+
+    # Replace any NaN or Inf with 1.0. NaN arises when max_val_pos was NaN
+    # (clamp does not propagate NaN, so it passes through to the division).
+    # Inf arises when max_val_pos was near zero and the division overflows float32.
+    # global_scale=1 means no global scaling, which is a safe fallback for
+    # uncalibrated experts.
+    global_scale = torch.nan_to_num(global_scale, nan=1.0, posinf=1.0, neginf=1.0)
+
     return global_scale.to(dtype).reshape([1])
 
 
 def strategy_cdiv(
     value: int,
     divisor: int,
-    strategy: Optional[QuantizationStrategy],
+    strategy: QuantizationStrategy | None,
     strict: bool = False,
 ) -> int:
     dividend = math.ceil(value / divisor)
@@ -486,3 +359,71 @@ def strategy_cdiv(
             logger.bind(log_once=True).warning(message)
 
     return dividend
+
+
+def _get_dtype_eps(dtype: torch.dtype) -> float:
+    if dtype == FP8_E4M3_DATA.dtype:
+        return 0.125
+    elif dtype == FP4_E2M1_DATA.dtype:
+        return 0.25
+    elif torch.is_floating_point(torch.tensor([], dtype=dtype)):
+        return torch.finfo(dtype).eps
+    else:
+        return 1
+
+
+def calculate_block_padding(
+    shape: tuple[int, ...],
+    block_structure: tuple[int, int],
+) -> tuple[int, int]:
+    """
+    Calculate the padding needed to make tensor dimensions divisible by block size.
+
+    For block quantization, dimensions must be divisible by the block size for
+    proper scale alignment when layers are merged in inference frameworks like vLLM.
+
+    :param shape: shape of the tensor (at least 2D)
+    :param block_structure: [block_height, block_width] for block quantization
+    :return: tuple of (pad_rows, pad_cols) needed to make dimensions divisible
+    """
+    if len(shape) < 2:
+        raise ValueError(f"Tensor must be at least 2D, got shape {shape}")
+
+    rows, cols = shape[-2], shape[-1]
+    block_height, block_width = block_structure
+
+    pad_rows = (block_height - rows % block_height) % block_height
+    pad_cols = (block_width - cols % block_width) % block_width
+
+    return pad_rows, pad_cols
+
+
+def maybe_pad_tensor_for_block_quant(
+    tensor: torch.Tensor,
+    block_structure: tuple[int, int],
+) -> torch.Tensor:
+    """
+    Pad a tensor so its dimensions are divisible by the block size.
+
+    This is essential for FP8 block quantization when dimensions are not
+    divisible by block size. The padding ensures that when weights are
+    merged in inference frameworks (like vLLM's gate_up_proj), the scale
+    tensor blocks align correctly.
+
+    :param tensor: tensor to pad (at least 2D)
+    :param block_structure: [block_height, block_width] for block quantization
+    :return: padded tensor
+    """
+    original_shape = tensor.shape
+
+    pad_rows, pad_cols = calculate_block_padding(original_shape, block_structure)
+
+    if pad_rows == 0 and pad_cols == 0:
+        return tensor
+
+    # F.pad uses (left, right, top, bottom) for last two dimensions
+    padded_tensor = torch.nn.functional.pad(
+        tensor, (0, pad_cols, 0, pad_rows), mode="constant", value=0
+    )
+
+    return padded_tensor

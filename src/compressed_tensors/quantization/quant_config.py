@@ -1,19 +1,9 @@
-# Copyright (c) 2021 - present / Neuralmagic, Inc. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import defaultdict
 from enum import Enum
-from typing import Annotated, Any, Dict, List, Optional, Union
+from typing import Annotated, Any
 
 from compressed_tensors.config import CompressionFormat
 from compressed_tensors.quantization.quant_args import DynamicType, QuantizationArgs
@@ -21,11 +11,7 @@ from compressed_tensors.quantization.quant_scheme import (
     QuantizationScheme,
     preset_name_to_scheme,
 )
-from compressed_tensors.quantization.utils import (
-    is_module_quantized,
-    module_type,
-    parse_out_kv_cache_args,
-)
+from compressed_tensors.quantization.utils import is_module_quantized
 from pydantic import BaseModel, ConfigDict, Field
 from torch.nn import Module
 
@@ -39,27 +25,56 @@ __all__ = [
 ]
 
 
+def _map_to_checkpoint_names(model: Module, ignore_list: list[str]) -> list[str]:
+    """Translate ignore list entries from HF module names to checkpoint names.
+
+    Transformers v5 may rename weight keys on load (e.g. vision_embedder ->
+    embed_vision).  The ignore list is built from ``model.named_modules()``
+    which uses HF names, but safetensors keys use checkpoint names.  This
+    applies the same reverse mapping that ``save_pretrained`` uses for weights.
+    """
+    weight_conversions = getattr(model, "_weight_conversions", None)
+    if not weight_conversions:
+        return ignore_list
+
+    inverted = [conv.reverse_transform() for conv in reversed(weight_conversions)]
+
+    result = []
+    for name in ignore_list:
+        for rev in inverted:
+            renamed, matched = rev.rename_source_key(name)
+            if matched is not None:
+                name = renamed
+        result.append(name)
+
+    return result
+
+
 class QuantizationStatus(str, Enum):
     """
     Enum storing the different states a quantized layer can be in
 
-    Initialized: scale, zero points and observers have been attached to the layer but
-    are set to dummy values (not yet calibrated)
-    Calibration: scale and zero points have been calibrated through OBCQ or similar
-    algorithm, observers are still attached
-    Frozen: scale and zero points are finalized, observers have been deleted, weights
-    are still in their original precision
-    Compressed: weights have been converted to their target type or compressed to
-    their closed approximation
+    - Initialized: Quantization parameters are initialized to empty values
+    - Calibration: Quantization parameters are being calibrated, observers are attached
+    - Frozen: Quantization parameters are fully calibrated, observers are removed
+    - Compressed: All parameters are quantized to target dtype. If the weight param is
+        no longer applicable (i.e. if "weight" has been converted to "weight_packed"),
+        the weight param is pruned from the module.
+    - Decompressed: Parameters are converted back into frozen state. Quantization params
+        remain on the module so that the module can be compressed, but params are
+        pruned if they are no longer applicable or needed for compression
+        (i.e. if "weight_packed" has been converted to "weight").
+        Additionally, weight qdq is skipped during forward passes for better performance
     """
 
     INITIALIZED = "initialized"
     CALIBRATION = "calibration"
     FROZEN = "frozen"
     COMPRESSED = "compressed"
+    DECOMPRESSED = "decompressed"
 
     @classmethod
-    def lifecycle_order(cls) -> List["QuantizationStatus"]:
+    def lifecycle_order(cls) -> list["QuantizationStatus"]:
         """
         :return: list of correct quantization lifecycle order
         """
@@ -99,6 +114,7 @@ LIFECYCLE_ORDER = [
     QuantizationStatus.CALIBRATION,
     QuantizationStatus.FROZEN,
     QuantizationStatus.COMPRESSED,
+    QuantizationStatus.DECOMPRESSED,
 ]
 
 DEFAULT_QUANTIZATION_METHOD = "compressed-tensors"
@@ -135,13 +151,13 @@ class QuantizationConfig(BaseModel):
         are not quantized even if they match up with a target in config_groups
     """
 
-    config_groups: Dict[str, Union[QuantizationScheme, List[str]]]
+    config_groups: dict[str, QuantizationScheme | list[str]]
     quant_method: str = DEFAULT_QUANTIZATION_METHOD
-    kv_cache_scheme: Optional[QuantizationArgs] = None
+    kv_cache_scheme: QuantizationArgs | None = None
     format: str = DEFAULT_QUANTIZATION_FORMAT
     quantization_status: QuantizationStatus = QuantizationStatus.INITIALIZED
-    global_compression_ratio: Optional[float] = None
-    ignore: Optional[List[str]] = Field(default_factory=list)
+    global_compression_ratio: float | None = None
+    ignore: list[str] | None = Field(default_factory=list)
     # `run_compressed` is a dummy, unused arg for backwards compatibility
     # see: https://github.com/huggingface/transformers/pull/39324
     run_compressed: Annotated[Any, Field(exclude=True)] = None
@@ -165,8 +181,8 @@ class QuantizationConfig(BaseModel):
 
     @staticmethod
     def from_pretrained(
-        model: Module, format: Optional[Union[str, list]] = None
-    ) -> Optional["QuantizationConfig"]:
+        model: Module, format: str | list | None = None
+    ) -> "QuantizationConfig | None":
         """
         Converts a model into its associated QuantizationConfig based on the
         QuantizationScheme attached to each quantized module
@@ -174,42 +190,64 @@ class QuantizationConfig(BaseModel):
         :param model: model to calculate quantization scheme of
         :return: filled out QuantizationScheme for the input model
         """
-        quant_scheme_to_layers = []
-        quantization_status = None
-        ignore = {}
-        quantization_type_names = set()
+        from compressed_tensors.modeling import IMPL_ATTR
+        from compressed_tensors.quantization.lifecycle.initialize import (
+            is_attention_module,
+        )
+
+        # set of all quantization schemes
+        # TODO: make quant config/scheme/args frozen/hashable and use a set
+        quantization_schemes: list[QuantizationScheme] = list()
+
+        # use any status from modules (in practice, use the last module)
+        model_status = None
+
+        # set of all quantized types
+        # this is later used to create the ignore list
+        quantization_type_names: set[str] = set()
+
+        # maps types to names which are not quantized
+        # this is later used to create the ignore list
+        ignore: dict[str, list[str]] = defaultdict(list)
+
+        # this keeps track of any kvcache schemes
+        kv_cache_scheme: QuantizationArgs | None = None
+
         for name, submodule in model.named_modules():
-            layer_type = module_type(submodule)
-            if not is_module_quantized(submodule):
+            layer_type: str = get_vllm_module_type(type(submodule).__name__)
+
+            # add config group if quantized non-attention or attention quant
+            has_config_group = is_module_quantized(submodule) and (
+                not is_attention_module(submodule) or hasattr(submodule, IMPL_ATTR)
+            )
+            # only add kvcache if quant attention (which always implies kvcache)
+            has_kv_cache = is_module_quantized(submodule) and is_attention_module(
+                submodule
+            )
+
+            if has_config_group:
+                # add to running set of schemes/layer_type_names
+                model_status = getattr(submodule, "quantization_status", model_status)
+                quantization_type_names.add(layer_type)
+                if submodule.quantization_scheme not in quantization_schemes:
+                    quantization_schemes.append(submodule.quantization_scheme)
+
+            if has_kv_cache:
+                model_status = getattr(submodule, "quantization_status", model_status)
+                kv_cache_scheme = submodule.quantization_scheme.input_activations
+
+            if not has_config_group:
+                # add non-quantized layers to the ignore list
                 if layer_type not in ignore:
                     ignore[layer_type] = []
                 ignore[layer_type].append(name)
-            else:
-                if hasattr(submodule, "quantization_status"):
-                    quantization_status = submodule.quantization_status
-                scheme = submodule.quantization_scheme
-                quantization_type_names.add(layer_type)
 
-                match_found = False
-                for existing_scheme in quant_scheme_to_layers:
-                    if scheme == existing_scheme:
-                        match_found = True
-                        break
-                if not match_found:
-                    quant_scheme_to_layers.append(scheme)
-
-        if len(quant_scheme_to_layers) == 0:  # No quantized layers
+        if (
+            len(quantization_schemes) == 0 and kv_cache_scheme is None
+        ):  # No quantized layers
             return None
 
-        # kv-cache only, no weight/activation quantization
-        if (
-            len(quantization_type_names) == 1
-            and "attention" in list(quantization_type_names)[0].lower()
-        ):
-            quantization_type_names.add("Linear")
-
-        # clean up ignore list, we can leave out layers types if none of the
-        # instances are quantized
+        # create ignore list, only include layers whose class has ever been targeted
         consolidated_ignore = []
         for layer_type, ignore_names in ignore.items():
             if layer_type in quantization_type_names:
@@ -218,20 +256,17 @@ class QuantizationConfig(BaseModel):
             # else we leave it off the ignore list, doesn't fall under any of the
             # existing quantization schemes so it won't be quantized
 
-        kv_cache_args, quant_scheme_to_layers = parse_out_kv_cache_args(
-            quant_scheme_to_layers
-        )
-        kv_cache_scheme = (
-            kv_cache_args.model_dump() if kv_cache_args is not None else kv_cache_args
-        )
+        consolidated_ignore = _map_to_checkpoint_names(model, consolidated_ignore)
 
+        # create config groups from all unique schemes
         config_groups = {}
-        for idx, scheme in enumerate(quant_scheme_to_layers):
+        for idx, scheme in enumerate(quantization_schemes):
             group_name = "group_" + str(idx)
             config_groups[group_name] = scheme
 
+        # infer format
         if format is None:
-            if quantization_status == QuantizationStatus.COMPRESSED:
+            if model_status == QuantizationStatus.COMPRESSED:
                 format = CompressionFormat.int_quantized.value
             else:
                 format = CompressionFormat.dense.value
@@ -244,7 +279,7 @@ class QuantizationConfig(BaseModel):
 
         return QuantizationConfig(
             config_groups=config_groups,
-            quantization_status=quantization_status,
+            quantization_status=model_status,
             kv_cache_scheme=kv_cache_scheme,
             global_compression_ratio=None,
             format=format,
@@ -267,3 +302,18 @@ class QuantizationConfig(BaseModel):
 
     # TODO set `extra="forbid"` when upstream transformers is compatible
     model_config = ConfigDict(extra="ignore")
+
+
+def get_vllm_module_type(module_type: str) -> str:
+    """
+    Returns a string representing the module type used when loading in vLLM.
+    This is typically going to be the same as the `torch.nn.Module` type,
+    however specific cases like MoE gate layers need to be treated like "Linear"
+    layers for the purposes of config matching.
+    """
+    if "ExpertMLP" not in module_type and (
+        "Router" in module_type or "Gate" in module_type or "Gating" in module_type
+    ):
+        module_type = "Linear"
+
+    return module_type

@@ -1,23 +1,13 @@
-# Copyright (c) 2021 - present / Neuralmagic, Inc. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import warnings
 from copy import deepcopy
-from typing import List, Optional
 
+import torch
 from compressed_tensors.config import CompressionFormat
 from compressed_tensors.quantization.quant_args import (
+    FP8_E4M3_DATA,
     DynamicType,
     QuantizationArgs,
     QuantizationStrategy,
@@ -33,7 +23,7 @@ __all__ = [
 ]
 
 
-class QuantizationScheme(BaseModel):
+class QuantizationScheme(BaseModel, use_enum_values=True):
     """
     Set of QuantizationArgs defining how the weights, inputs and outputs of target list
     of modules should be quantized
@@ -46,11 +36,11 @@ class QuantizationScheme(BaseModel):
     :param format: CompressionFormat for the layer
     """
 
-    targets: List[str]
-    weights: Optional[QuantizationArgs] = None
-    input_activations: Optional[QuantizationArgs] = None
-    output_activations: Optional[QuantizationArgs] = None
-    format: Optional[str] = None
+    targets: list[str]
+    weights: QuantizationArgs | None = None
+    input_activations: QuantizationArgs | None = None
+    output_activations: QuantizationArgs | None = None
+    format: CompressionFormat | None = None
 
     @model_validator(mode="after")
     def validate_model_after(model: "QuantizationScheme") -> "QuantizationScheme":
@@ -91,7 +81,7 @@ class QuantizationScheme(BaseModel):
                 raise ValueError("Cannot apply actorder to output activations")
 
         # validate format
-        if format == CompressionFormat.mixed_precision.value:
+        if format == CompressionFormat.mixed_precision:
             raise ValueError(
                 "mixed-precision cannot be set as a format for a QuantizationScheme"
             )
@@ -151,7 +141,7 @@ Pre-Set Quantization Scheme Args
 """
 
 
-def preset_name_to_scheme(name: str, targets: List[str]) -> QuantizationScheme:
+def preset_name_to_scheme(name: str, targets: list[str]) -> QuantizationScheme:
     """
     :param name: preset quantization settings name. must exist in upper case in
         PRESET_SCHEMES
@@ -191,6 +181,8 @@ NVFP4A16 = dict(
         symmetric=True,
         dynamic=False,
         group_size=16,
+        scale_dtype=FP8_E4M3_DATA.dtype,
+        zp_dtype=FP8_E4M3_DATA.dtype,
     )
 )
 
@@ -203,6 +195,8 @@ NVFP4 = dict(
         symmetric=True,
         dynamic=False,
         group_size=16,
+        scale_dtype=FP8_E4M3_DATA.dtype,
+        zp_dtype=FP8_E4M3_DATA.dtype,
     ),
     input_activations=QuantizationArgs(
         num_bits=4,
@@ -211,8 +205,83 @@ NVFP4 = dict(
         symmetric=True,
         dynamic=DynamicType.LOCAL,
         group_size=16,
+        scale_dtype=FP8_E4M3_DATA.dtype,
+        zp_dtype=FP8_E4M3_DATA.dtype,
     ),
 )
+
+MXFP4A16 = dict(
+    weights=QuantizationArgs(
+        num_bits=4,
+        type=QuantizationType.FLOAT,
+        strategy=QuantizationStrategy.GROUP,
+        symmetric=True,
+        dynamic=False,
+        group_size=32,
+        scale_dtype=torch.uint8,
+        zp_dtype=torch.uint8,
+    )
+)
+
+MXFP4 = dict(
+    weights=QuantizationArgs(
+        num_bits=4,
+        type=QuantizationType.FLOAT,
+        strategy=QuantizationStrategy.GROUP,
+        symmetric=True,
+        dynamic=False,
+        group_size=32,
+        scale_dtype=torch.uint8,
+        zp_dtype=torch.uint8,
+    ),
+    input_activations=QuantizationArgs(
+        num_bits=4,
+        type=QuantizationType.FLOAT,
+        strategy=QuantizationStrategy.GROUP,
+        dynamic=True,
+        symmetric=True,
+        group_size=32,
+        scale_dtype=torch.uint8,
+        zp_dtype=torch.uint8,
+    ),
+)
+
+MXFP8A16 = dict(
+    weights=QuantizationArgs(
+        num_bits=8,
+        type=QuantizationType.FLOAT,
+        strategy=QuantizationStrategy.GROUP,
+        symmetric=True,
+        dynamic=False,
+        group_size=32,
+        scale_dtype=torch.uint8,
+        zp_dtype=torch.uint8,
+    )
+)
+
+MXFP8 = dict(
+    weights=QuantizationArgs(
+        num_bits=8,
+        type=QuantizationType.FLOAT,
+        strategy=QuantizationStrategy.GROUP,
+        symmetric=True,
+        dynamic=False,
+        group_size=32,
+        scale_dtype=torch.uint8,
+        zp_dtype=torch.uint8,
+    ),
+    input_activations=QuantizationArgs(
+        num_bits=8,
+        type=QuantizationType.FLOAT,
+        strategy=QuantizationStrategy.GROUP,
+        dynamic=True,
+        symmetric=True,
+        group_size=32,
+        scale_dtype=torch.uint8,
+        zp_dtype=torch.uint8,
+    ),
+)
+
 
 # 8 bit integer weights and 8 bit activations quantization
 INT8_W8A8 = dict(
@@ -229,7 +298,6 @@ INT8_W8A8 = dict(
         strategy=QuantizationStrategy.TOKEN,
         symmetric=True,
         dynamic=True,
-        observer=None,
     ),
 )
 
@@ -238,7 +306,8 @@ W8A16 = dict(
     weights=QuantizationArgs(
         num_bits=8,
         type=QuantizationType.INT,
-        strategy=QuantizationStrategy.CHANNEL,
+        strategy=QuantizationStrategy.GROUP,
+        group_size=128,
         symmetric=True,
         dynamic=False,
     ),
@@ -284,6 +353,25 @@ INT8_W4A8 = dict(
         strategy=QuantizationStrategy.TOKEN,
         symmetric=True,
         dynamic=True,
+    ),
+)
+
+# 4 bit integer weights and 8 bit FP activations quantization
+W4AFP8 = dict(
+    weights=QuantizationArgs(
+        num_bits=4,
+        type=QuantizationType.INT,
+        strategy=QuantizationStrategy.GROUP,
+        group_size=128,
+        symmetric=True,
+        dynamic=False,
+    ),
+    input_activations=QuantizationArgs(
+        num_bits=8,
+        type=QuantizationType.FLOAT,
+        strategy=QuantizationStrategy.TOKEN,
+        symmetric=True,
+        dynamic=True,
         observer=None,
     ),
 )
@@ -303,6 +391,7 @@ FP8 = dict(
         strategy=QuantizationStrategy.TENSOR,
         symmetric=True,
         dynamic=False,
+        observer="static_minmax",
     ),
 )
 
@@ -321,7 +410,6 @@ FP8_DYNAMIC = dict(
         strategy=QuantizationStrategy.TOKEN,
         symmetric=True,
         dynamic=True,
-        observer=None,
     ),
 )
 
@@ -343,7 +431,6 @@ FP8_BLOCK = dict(
         strategy=QuantizationStrategy.GROUP,
         symmetric=True,
         dynamic=True,
-        observer=None,
         group_size=128,
     ),
 )
@@ -359,10 +446,15 @@ PRESET_SCHEMES = {
     "W8A8": INT8_W8A8,
     "INT8": INT8_W8A8,  # alias for W8A8
     "W4A8": INT8_W4A8,
+    "W4AFP8": W4AFP8,
     # Float weight and activation schemes
     "FP8": FP8,
     "FP8_DYNAMIC": FP8_DYNAMIC,
     "FP8_BLOCK": FP8_BLOCK,
     "NVFP4A16": NVFP4A16,
     "NVFP4": NVFP4,
+    "MXFP4A16": MXFP4A16,
+    "MXFP4": MXFP4,
+    "MXFP8A16": MXFP8A16,
+    "MXFP8": MXFP8,
 }

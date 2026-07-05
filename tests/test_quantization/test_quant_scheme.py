@@ -1,16 +1,5 @@
-# Copyright (c) 2021 - present / Neuralmagic, Inc. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
 from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
@@ -61,3 +50,34 @@ def test_defaults():
     assert output.input_activations is None
     assert output.output_activations is None
     assert output.format is None
+
+
+def test_serialize_scheme():
+    """Test serialization of QuantizationScheme including format"""
+    from compressed_tensors.config import CompressionFormat
+
+    targets = ["Linear"]
+    weights = QuantizationArgs(num_bits=4, symmetric=True, group_size=128)
+    input_activations = QuantizationArgs(num_bits=8, dynamic=True)
+    output_activations = QuantizationArgs(num_bits=8, type="float", symmetric=False)
+
+    scheme = QuantizationScheme(
+        targets=targets,
+        weights=weights,
+        input_activations=input_activations,
+        output_activations=output_activations,
+        format=CompressionFormat.pack_quantized,
+    )
+
+    # Serialize to dict
+    scheme_dict = scheme.model_dump()
+    assert scheme_dict["targets"] == targets
+    assert scheme_dict["format"] == "pack-quantized"
+    assert "weights" in scheme_dict
+    assert scheme_dict["weights"]["num_bits"] == 4
+    assert "input_activations" in scheme_dict
+    assert "output_activations" in scheme_dict
+
+    # Deserialize from dict
+    reloaded = QuantizationScheme.model_validate(scheme_dict)
+    assert reloaded == scheme

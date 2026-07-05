@@ -1,26 +1,16 @@
-# Copyright (c) 2021 - present / Neuralmagic, Inc. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import contextlib
 import warnings
+from collections.abc import Callable, Iterable, Mapping
 from functools import wraps
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy
 import torch
-from transformers import AutoConfig
+from transformers import AutoConfig, PretrainedConfig
 
 
 T = TypeVar("T", bound="Callable")  # used by `deprecated`
@@ -44,7 +34,12 @@ __all__ = [
     "pack_bitmasks",
     "unpack_bitmasks",
     "patch_attr",
+    "patch_attrs",
     "ParameterizedDefaultDict",
+    "get_num_attn_heads",
+    "get_num_kv_heads",
+    "get_head_dim",
+    "is_accelerator_type",
 ]
 
 FSDP_WRAPPER_NAME = "_fsdp_wrapped_module"
@@ -52,7 +47,7 @@ FSDP_WRAPPER_NAME = "_fsdp_wrapped_module"
 
 def infer_compressor_from_model_config(
     pretrained_model_name_or_path: str,
-) -> Optional["ModelCompressor"]:  # noqa: F821
+) -> "ModelCompressor | None":  # noqa: F821
     """
     Given a path to a model config, extract a sparsity config if it exists and return
     the associated ModelCompressor
@@ -171,7 +166,7 @@ def getattr_chain(obj: Any, chain_str: str, *args, **kwargs) -> Any:
 
 
 def deprecated(
-    future_name: Optional[str] = None, message: Optional[str] = None
+    future_name: str | None = None, message: str | None = None
 ) -> Callable[[T], T]:
     """
     Decorator to mark functions as deprecated
@@ -210,7 +205,7 @@ class Aliasable:
     """
 
     @staticmethod
-    def get_aliases() -> Dict[str, str]:
+    def get_aliases() -> dict[str, str]:
         raise NotImplementedError()
 
     def __eq__(self, other):
@@ -232,8 +227,8 @@ class Aliasable:
 
 
 def shard_tensor(
-    tensor: torch.Tensor, shard_sizes: List[int], dim: int = 0
-) -> List[torch.Tensor]:
+    tensor: torch.Tensor, shard_sizes: list[int], dim: int = 0
+) -> list[torch.Tensor]:
     """
     Shards a tensor into a list of tensors along a given dimension.
 
@@ -263,7 +258,7 @@ def shard_tensor(
     return shards
 
 
-def combine_shards(shards, dim=0):
+def combine_shards(shards: list[torch.Tensor], dim: int = 0) -> torch.Tensor:
     """
     Combine decompressed shards along a given dimension using `narrow`.
 
@@ -311,7 +306,7 @@ def pack_bitmasks(bytemasks: torch.Tensor) -> torch.Tensor:
 
 
 def unpack_bitmasks(
-    packed_bitmasks: torch.Tensor, original_shape: List[int]
+    packed_bitmasks: torch.Tensor, original_shape: list[int]
 ) -> torch.Tensor:
     """
     Converts a bitmask tensor back to a bytemask tensor for use during decompression
@@ -365,6 +360,34 @@ def patch_attr(base: object, attr: str, value: Any):
             delattr(base, attr)
 
 
+@contextlib.contextmanager
+def patch_attrs(bases: Iterable[Any], attr: str, values: Iterable[Any]):
+    """
+    Same as `patch_attr` but for a list of objects to patch
+    Patch attribute for a list of objects with list of values.
+    Original values are restored upon exit
+
+    :param bases: objects which has the attribute to patch
+    :param attr: name of the the attribute to patch
+    :param values: used to replace original values. Must be same
+        length as bases
+
+    Usage:
+    >>> from types import SimpleNamespace
+    >>> obj1 = SimpleNamespace()
+    >>> obj2 = SimpleNamespace()
+    >>> with patch_attr([obj1, obj2], "attribute", ["value1", "value2"]):
+    ...     assert obj1.attribute == "value1"
+    ...     assert obj2.attribute == "value2"
+    >>> assert not hasattr(obj1, "attribute")
+    >>> assert not hasattr(obj2, "attribute")
+    """
+    with contextlib.ExitStack() as stack:
+        for base, value in zip(bases, values):
+            stack.enter_context(patch_attr(base, attr, value))
+        yield
+
+
 class ParameterizedDefaultDict(dict):
     """
     Similar to `collections.DefaultDict`, but upon fetching a key which is missing,
@@ -396,3 +419,73 @@ class ParameterizedDefaultDict(dict):
         """
         with patch_attr(self, "_factory_kwargs", factory_kwargs):
             return self[args]
+
+
+def get_num_attn_heads(config: PretrainedConfig) -> int:
+    """
+    Get the number of attention heads used by a model
+
+    :param config: model config
+    :return: num_attention_heads of model
+    """
+    if hasattr(config, "num_attention_heads"):
+        return config.num_attention_heads
+
+    elif hasattr(config, "hidden_size") and hasattr(config, "head_dim"):
+        return config.hidden_size // config.head_dim
+
+    else:
+        raise ValueError(
+            "Cannot determine num_attention_heads from config. Config must define "
+            "either `num_attention_heads` or both `hidden_size` and `head_dim`. "
+            f"{config}"
+        )
+
+
+def get_num_kv_heads(config: PretrainedConfig) -> int:
+    """
+    Get the number of key-value attention heads used by a model
+
+    :param config: model config
+    :return: num_key_value_heads of model
+    """
+    if hasattr(config, "num_key_value_heads"):
+        return config.num_key_value_heads
+
+    else:
+        raise ValueError(
+            "Cannot determine num_key_value_heads from config. Config must define "
+            f"`num_key_value_heads`. {config}"
+        )
+
+
+def get_head_dim(config: PretrainedConfig) -> int:
+    """
+    Get the number of dimensions used by the attention heads of a model
+
+    :param config: model config
+    :return: head_dim of model
+    """
+    if hasattr(config, "head_dim"):
+        return config.head_dim
+
+    elif hasattr(config, "hidden_size") and hasattr(config, "num_attention_heads"):
+        return config.hidden_size // config.num_attention_heads
+
+    else:
+        raise ValueError(
+            "Cannot determine head_dim from config. Config must define "
+            "either `head_dim` or both `hidden_size` and `num_attention_heads`. "
+            f"{config}"
+        )
+
+
+def is_accelerator_type(device_type: str) -> bool:
+    """Return ``True`` if *device_type* matches the current accelerator.
+
+    Works for any backend exposed via :mod:`torch.accelerator` — CUDA, XPU,
+    NPU, etc.  Returns ``False`` when no accelerator is present.
+    """
+    if not torch.accelerator.is_available():
+        return False
+    return device_type == torch.accelerator.current_accelerator().type

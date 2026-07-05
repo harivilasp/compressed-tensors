@@ -1,18 +1,5 @@
-# Copyright (c) 2021 - present / Neuralmagic, Inc. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-from typing import Optional
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
 from compressed_tensors.transform import TransformArgs, TransformScheme
@@ -37,7 +24,7 @@ class RandomMatrixFactory(TransformFactory):
     :param seed: random seed used to transform weight randomization
     """
 
-    def __init__(self, name: str, scheme: TransformScheme, seed: Optional[int] = None):
+    def __init__(self, name: str, scheme: TransformScheme, seed: int | None = None):
         super().__init__(name, scheme, seed)
         self.weights = ParameterizedDefaultDict(self._create_weight)
         self.inverses = ParameterizedDefaultDict(self._create_inverse)
@@ -50,7 +37,6 @@ class RandomMatrixFactory(TransformFactory):
         :param module: parent module that transform will be applied to
         :param args: defines how the transform will be applied to the module
         """
-        assert hasattr(module, "weight")
         size = get_transform_size(module, args.location, self.scheme.head_dim)
         device = get_offloaded_device(module)
         precision = self.scheme.precision if args.is_online() else torch.float64
@@ -68,8 +54,8 @@ class RandomMatrixFactory(TransformFactory):
             (size, size),
             generator=self.generator,
             dtype=precision,
-            device=device,
-        )
+            device=self.generator.device,
+        ).to(device)
         return Parameter(data, requires_grad=self.scheme.requires_grad)
 
     def _create_inverse(self, weight: Parameter) -> Parameter:
@@ -110,5 +96,29 @@ class RandomMatrixTransform(TransformBase):
         ).to(value.dtype)
 
 
+def _has_cpu_lapack() -> bool:
+    try:
+        torch.linalg.inv(torch.eye(2, dtype=torch.float64))
+        return True
+    except RuntimeError:
+        return False
+
+
+_cpu_lapack_available: bool | None = None
+
+
 def high_precision_invert(weight: Tensor) -> Tensor:
-    return torch.linalg.inv(weight.to(torch.float64)).to(weight.dtype)
+    global _cpu_lapack_available
+    original_device = weight.device
+    compute_device = original_device
+
+    # If the tensor is on CPU and LAPACK is not available (e.g. ROCm builds),
+    # move to GPU for the inversion
+    if compute_device.type == "cpu":
+        if _cpu_lapack_available is None:
+            _cpu_lapack_available = _has_cpu_lapack()
+        if not _cpu_lapack_available and torch.cuda.is_available():
+            compute_device = torch.device("cuda")
+
+    result = torch.linalg.inv(weight.to(device=compute_device, dtype=torch.float64))
+    return result.to(device=original_device, dtype=weight.dtype)

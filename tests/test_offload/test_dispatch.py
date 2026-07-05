@@ -1,0 +1,291 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from unittest.mock import patch
+
+import pytest
+import torch
+from compressed_tensors.offload.cache import CPUCache, OffloadCache
+from compressed_tensors.offload.dispatch import (
+    dispatch_model,
+    dispatch_with_map,
+    get_device_memory,
+    set_onload_device,
+)
+from compressed_tensors.offload.utils import module_size
+from tests.test_offload.conftest import skip_if_mps_device
+from tests.testing_utils import requires_gpu
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+ACCELERATOR_TYPE = torch.accelerator.current_accelerator().type
+ACCELERATOR_DEVICE_0 = torch.device(ACCELERATOR_TYPE, 0)
+ACCELERATOR_DEVICE_1 = torch.device(ACCELERATOR_TYPE, 1)
+
+
+class Decoder(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear0 = torch.nn.Linear(5, 5)
+        self.linear1 = torch.nn.Linear(5, 5)
+
+    def forward(self, input):
+        return self.linear1(self.linear0(input))
+
+
+class Model(torch.nn.Module):
+    _no_split_modules = ["Decoder"]
+
+    def __init__(self):
+        super().__init__()
+        self.decoder0 = Decoder()
+        self.decoder1 = Decoder()
+
+    def forward(self, input):
+        return self.decoder1(self.decoder0(input))
+
+
+def assert_module_on_device(module: torch.nn.Module, device: torch.device | str):
+    assert not isinstance(module._parameters, CPUCache)
+    for name, param in module.named_parameters():
+        assert torch.device(param.device) == torch.device(device), name
+
+
+def assert_module_offloaded(
+    module: torch.nn.Module,
+    onload_device: torch.device | str,
+    offload_device: torch.device | str,
+    req_params: bool = False,
+):
+    for name, submodule in module.named_modules():
+        if isinstance(submodule, torch.nn.ModuleList):
+            continue
+        if req_params and module_size(submodule)[0] <= 0:
+            continue
+
+        assert isinstance(submodule._parameters, OffloadCache), name
+        assert torch.device(submodule._parameters.onload_device) == torch.device(
+            onload_device
+        )
+        assert torch.device(submodule._parameters.offload_device) == torch.device(
+            offload_device
+        )
+
+
+def has_memory_requirements(device_memory: dict[torch.device, int]):
+    real_device_memory = get_device_memory()
+    for key, req in device_memory.items():
+        if key not in real_device_memory or real_device_memory[key] < req:
+            return False
+
+    return True
+
+
+@pytest.mark.unit
+def test_dispatch_with_map_skips_missing_local_modules():
+    # Sharded-MoE pattern: a device map is authored from the source rank's
+    # view of the model, then broadcast to every rank (see from_accelerate).
+    # On ranks that do not own a given routed expert, that ModuleList slot is
+    # a None placeholder, so dispatch_with_map must skip the map entry rather
+    # than crash in model.get_submodule (issue #711).
+    class MoEModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = torch.nn.ModuleList(
+                [None, torch.nn.Linear(5, 5), None, torch.nn.Linear(5, 5)]
+            )
+
+    model = MoEModel()
+    cpu = torch.device("cpu")
+    device_map = {
+        "experts.0": (cpu, cpu),  # None placeholder on this rank
+        "experts.1": (cpu, cpu),
+        "experts.2": (cpu, cpu),  # None placeholder on this rank
+        "experts.3": (cpu, cpu),
+    }
+
+    with patch("compressed_tensors.offload.dispatch.offload_module") as mock_offload:
+        # must not raise AttributeError("`0` is not an nn.Module")
+        dispatch_with_map(model, device_map, show_progress=False)
+
+    dispatched = [call.args[0] for call in mock_offload.call_args_list]
+    # only the locally-present experts are dispatched; None slots are skipped
+    assert mock_offload.call_count == 2
+    assert model.experts[1] in dispatched
+    assert model.experts[3] in dispatched
+
+
+@pytest.mark.unit
+@skip_if_mps_device
+@requires_gpu
+def test_dispatch_one_device():
+    model = Model()
+    device_memory = {ACCELERATOR_DEVICE_0: module_size(model)}
+    if not has_memory_requirements(device_memory):
+        pytest.skip("Cannot perform one device dispatch test, not enough device memory")
+
+    dispatch_model(model, device_memory=device_memory, extra_memory=0)
+    assert_module_on_device(model, ACCELERATOR_DEVICE_0)
+
+
+@pytest.mark.unit
+@skip_if_mps_device
+@requires_gpu
+def test_dispatch_two_devices():
+    model = Model()
+    device_memory = {
+        ACCELERATOR_DEVICE_0: module_size(model.decoder0),
+        ACCELERATOR_DEVICE_1: module_size(model) - module_size(model.decoder0),
+    }
+    if not has_memory_requirements(device_memory):
+        pytest.skip("Cannot perform split dispatch test: not enough devices or memory")
+
+    # first decoder on first device, rest on second device
+    dispatch_model(model, device_memory=device_memory, extra_memory=0)
+    assert_module_on_device(model.decoder0, ACCELERATOR_DEVICE_0)
+    assert_module_on_device(model.decoder1, ACCELERATOR_DEVICE_1)
+
+
+@pytest.mark.unit
+@skip_if_mps_device
+@requires_gpu
+def test_dispatch_no_split():
+    model = Model()
+    device_memory = {
+        ACCELERATOR_DEVICE_0: module_size(model.decoder0.linear0),
+        ACCELERATOR_DEVICE_1: module_size(model),
+    }
+    if not has_memory_requirements(device_memory):
+        pytest.skip("Cannot perform split dispatch test: not enough devices or mem")
+
+    # first device is skipped: all ends up on second device
+    dispatch_model(model, device_memory=device_memory, extra_memory=0)
+    assert_module_on_device(model, ACCELERATOR_DEVICE_1)
+
+
+@pytest.mark.unit
+@skip_if_mps_device
+@requires_gpu
+def test_dispatch_split():
+    model = Model()
+    first_linear = model.decoder0.linear0
+    device_memory = {
+        ACCELERATOR_DEVICE_0: module_size(first_linear),
+        ACCELERATOR_DEVICE_1: module_size(model) - module_size(first_linear),
+    }
+    if not has_memory_requirements(device_memory):
+        pytest.skip("Cannot perform split dispatch test: not enough devices or memory")
+
+    # first linear on first device, rest on second device
+    dispatch_model(
+        model, device_memory=device_memory, no_split_modules=tuple(), extra_memory=0
+    )
+    assert_module_on_device(model.decoder0.linear0, ACCELERATOR_DEVICE_0)
+    assert_module_on_device(model.decoder0.linear1, ACCELERATOR_DEVICE_1)
+    assert_module_on_device(model.decoder1, ACCELERATOR_DEVICE_1)
+
+
+@pytest.mark.unit
+@skip_if_mps_device
+@requires_gpu
+def test_dispatch_offloaded():
+    model = Model()
+    device_memory = {
+        ACCELERATOR_DEVICE_0: (
+            module_size(model.decoder0.linear0) + module_size(model.decoder1)
+        ),
+    }
+    if not has_memory_requirements(device_memory):
+        pytest.skip("Cannot perform split dispatch test: not enough devices or mem")
+
+    with patch("compressed_tensors.offload.dispatch.get_module_sizes") as mock_sizes:
+        # first two linears are disjoint, but not enough memory to fit decoder1
+        mock_sizes.return_value = [
+            (model.decoder0.linear0, module_size(model.decoder0.linear0)),
+            (model.decoder0.linear1, module_size(model.decoder0.linear1)),
+            (model.decoder1, module_size(model.decoder1)),
+        ]
+
+        # first linear stays onloaded
+        # second linear is popped off to fit offloaded decoder1
+        dispatch_model(
+            model, device_memory=device_memory, no_split_modules=tuple(), extra_memory=0
+        )
+        assert_module_on_device(model.decoder0.linear0, ACCELERATOR_DEVICE_0)
+        assert_module_offloaded(model.decoder0.linear1, ACCELERATOR_DEVICE_0, "cpu")
+        assert_module_offloaded(model.decoder1, ACCELERATOR_DEVICE_0, "cpu")
+
+
+@pytest.mark.integration
+@requires_gpu
+@pytest.mark.parametrize("model_id", ["nm-testing/tinysmokellama-3.2"])
+@skip_if_mps_device
+@torch.inference_mode()
+def test_offload_and_dispatch_model(model_id):
+    model = AutoModelForCausalLM.from_pretrained(model_id).eval()
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+    tied_tensors_size = model.lm_head.weight.nbytes
+    device_memory = {ACCELERATOR_DEVICE_0: module_size(model) + tied_tensors_size}
+    if not has_memory_requirements(device_memory):
+        pytest.skip("Cannot perform split dispatch test: not enough devices or mem")
+
+    model.to(ACCELERATOR_DEVICE_0)
+    sample = tokenizer("Hello my name is", return_tensors="pt")
+    sample = {k: v.to(ACCELERATOR_DEVICE_0) for k, v in sample.items()}
+    true_logits = model(**sample).logits
+
+    # offload entire model
+    model.to("cpu")
+    model = set_onload_device(model, ACCELERATOR_DEVICE_0)
+    offloaded_logits = model(**sample).logits
+    for module in model.modules():
+        assert_module_offloaded(module, ACCELERATOR_DEVICE_0, torch.device("cpu"))
+    assert torch.allclose(offloaded_logits, true_logits)
+
+    # dispatch model and fits
+    model = dispatch_model(model, device_memory=device_memory, extra_memory=0)
+    dispatched_logits = model(**sample).logits
+    for module in model.modules():
+        assert_module_on_device(module, ACCELERATOR_DEVICE_0)
+    assert torch.allclose(dispatched_logits, true_logits)
+
+    # dispatch model with offload
+    device_memory[ACCELERATOR_DEVICE_0] = device_memory[ACCELERATOR_DEVICE_0] // 2
+    model = dispatch_model(model, device_memory=device_memory, extra_memory=0)
+    dispatched_logits = model(**sample).logits
+    assert torch.allclose(dispatched_logits, true_logits)
+
+
+@pytest.mark.unit
+@pytest.mark.skip_xpu  # mocks torch.accelerator for CPU fallback path
+def test_get_device_memory_cpu_fallback():
+    with patch("compressed_tensors.offload.dispatch.torch.accelerator") as mock_accel:
+        mock_accel.is_available.return_value = False
+        device_memory = get_device_memory()
+
+    assert len(device_memory) == 1
+    assert torch.device("cpu") in device_memory
+    assert device_memory[torch.device("cpu")] > 0
+
+
+@pytest.mark.unit
+def test_dispatch_cpu_only():
+    model = Model()
+    cpu_memory = module_size(model) * 2
+    device_memory = {torch.device("cpu"): cpu_memory}
+
+    dispatch_model(model, device_memory=device_memory, extra_memory=0)
+    assert_module_on_device(model, "cpu")
+
+
+@pytest.mark.unit
+@pytest.mark.skip_xpu  # mocks torch.accelerator for CPU fallback path
+def test_dispatch_cpu_only_via_fallback():
+    model = Model()
+
+    with patch("compressed_tensors.offload.dispatch.torch.accelerator") as mock_accel:
+        mock_accel.is_available.return_value = False
+        dispatch_model(model, extra_memory=0)
+
+    assert_module_on_device(model, "cpu")

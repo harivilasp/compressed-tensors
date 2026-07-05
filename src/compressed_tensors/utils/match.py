@@ -1,21 +1,12 @@
-# Copyright (c) 2021 - present / Neuralmagic, Inc. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
+import os
 import re
-from collections.abc import Generator
-from typing import Iterable, List, Mapping, Optional, Tuple, Union
+from collections import defaultdict
+from collections.abc import Generator, Iterable, Mapping
+from typing import Iterator
 
 import torch
 from compressed_tensors.utils.internal import InternalModule
@@ -25,11 +16,15 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
 __all__ = [
+    "match_name",
     "match_named_modules",
     "match_named_parameters",
     "match_targets",
     "match_modules_set",
+    "match_quantizable_tensors",
+    "get_lowest_common_ancestor_name",
     "is_match",
+    "is_narrow_match",
 ]
 
 
@@ -38,11 +33,11 @@ FusedMappping = Mapping[str, Iterable[str]]
 
 def match_named_modules(
     model: torch.nn.Module,
-    targets: Optional[Iterable[str]],
-    ignore: Optional[Iterable[str]] = None,
-    fused: Optional[FusedMappping] = None,
+    targets: Iterable[str] | None,
+    ignore: Iterable[str] | None = None,
+    fused: FusedMappping | None = None,
     warn_on_fail: bool = False,
-) -> Generator[Tuple[str, torch.nn.Module]]:
+) -> Generator[tuple[str, torch.nn.Module], None, None]:
     """
     Yields names and modules which match `targets` but do not match `ignore`.
     Values are returned in order of `model.named_modules()`
@@ -77,11 +72,11 @@ def match_named_modules(
 
 def match_named_parameters(
     model: torch.nn.Module,
-    targets: Optional[Iterable[str]],
-    ignore: Optional[Iterable[str]] = None,
-    fused: Optional[FusedMappping] = None,
+    targets: Iterable[str] | None,
+    ignore: Iterable[str] | None = None,
+    fused: FusedMappping | None = None,
     warn_on_fail: bool = False,
-) -> Generator[Tuple[str, torch.nn.Module, torch.nn.Parameter]]:
+) -> Generator[tuple[str, torch.nn.Module, torch.nn.Parameter], None, None]:
     """
     Yields parameters which match `targets` but do not match `ignore`.
     Values are returned in order of `model.named_modules()`
@@ -105,10 +100,10 @@ def match_named_parameters(
         for param_name, param in module.named_parameters(recurse=False):
             param_fqn = f"{module_name}.{param_name}"
             for target in targets:
-                if _match_name(param_fqn, target, fused):
+                if match_name(param_fqn, target, fused):
                     unmatched_targets -= {target}
 
-                    if not any(_match_name(param_fqn, ign, fused) for ign in ignore):
+                    if not any(match_name(param_fqn, ign, fused) for ign in ignore):
                         yield param_fqn, module, param
 
     if warn_on_fail:
@@ -119,8 +114,8 @@ def match_named_parameters(
 
 
 def match_targets(
-    name: str, module: torch.nn.Module, targets: Optional[Iterable[str]]
-) -> List[str]:
+    name: str, module: torch.nn.Module, targets: Iterable[str] | None
+) -> list[str]:
     """
     Returns the targets that match the given name and module.
 
@@ -146,7 +141,7 @@ def match_targets(
     targets = sorted(targets, key=lambda x: ("re:" in x, x))
     matched_targets = []
     for target in targets:
-        if _match_name(name, target):
+        if match_name(name, target):
             matched_targets.append(target)
 
     for target in targets:
@@ -156,34 +151,68 @@ def match_targets(
     return matched_targets
 
 
+def get_lowest_common_ancestor_name(names: list[str | None]) -> str:
+    """
+    Given a list of names, returns the lowest-scope common name ignoring Nones.
+
+    Implementation is a small alteration of os.path.commonprefix
+    https://docs.python.org/3/library/os.path.html#os.path.commonprefix
+
+    ([s1, s2]->prefix->result)
+    # case 0: multiple modules: [abc.a., abc.b.] -> .abc. -> abc
+    # case 1: single module: [abc.] -> .abc. -> abc
+    # case 2: substring modules: [abc., ab.] -> .ab -> ""
+    # case 3: parent & child: [ab., ab.a.] -> .ab. -> ab
+    """
+    names = [name for name in names if name is not None]
+    if len(names) == 0:
+        return ""
+
+    # 1) find longest shared prefix
+    s1 = "." + min(names) + "."
+    s2 = "." + max(names) + "."
+    common_prefix = os.path.commonprefix([s1, s2])
+    # 2) throw away right most dot and name fragment, throw away leftmost char
+    # ".keep.thro" -> "keep", "." -> ""
+    return common_prefix[1 : common_prefix.rfind(".")]
+
+
 def match_modules_set(
     model: torch.nn.Module,
-    targets: Optional[Iterable[str]],
-    ignore: Optional[Iterable[str]] = None,
-) -> Generator[Iterable[torch.nn.Module]]:
+    targets: Iterable[str] | None,
+    ignore: Iterable[str] | None = None,
+    error_on_module_rematch: bool = True,
+) -> Generator[list[list[torch.nn.Module]], None, None]:
     """
-    Yields modules grouped with the same order and size as `targets`.
-    Values are returned in order of `model.named_modules()`
+    Yields modules grouped by parent context.
 
-    E.g. the following targets would yield module belonging to the following layers:
+    We group by parent context so that we can return ALL matches of a
+    specific target that can be paired with another target. This is most
+    relevant in the case of MoE modules with multiple modules for each
+    expert i.e. post_attention_layernorm <-> mlp.expert.N.gate_proj,
+    mlp.expert.N.up_proj for all N. The parent context will differ from
+    one layer to another while being the same for one expert to another.
+
+    Each returned group is a list (of lists) with the same size
+    and order as `targets` while all matches for each target and
+    the overall order of the groups are ordered in the same way
+    as `model.named_modules`
+
+
+    E.g. the following targets would yield modules belonging to the following layers:
     ```python3
     match_modules_set(model, ["q_proj", "k_proj", "v_proj"]) == (
-        (
-            `model.layers.0.self_attn.q_proj`,
-            `model.layers.0.self_attn.k_proj`,
-            `model.layers.0.self_attn.v_proj`,
-        ),
-        (
-            `model.layers.1.self_attn.q_proj`,
-            `model.layers.1.self_attn.k_proj`,
-            `model.layers.1.self_attn.v_proj`,
-        ),
+        [
+            [`layers.0.self_attn.q_proj`],
+            [`layers.0.self_attn.k_proj`],
+            [`layers.0.self_attn.v_proj`],
+        ],
+        [
+            [`layers.1.self_attn.q_proj`],
+            [`layers.1.self_attn.k_proj`],
+            [`layers.1.self_attn.v_proj`],
+        ],
         ...
-        (
-            `model.layers.32.self_attn.q_proj`,
-            `model.layers.32.self_attn.k_proj`,
-            `model.layers.32.self_attn.v_proj`,
-        ),
     )
     ```
 
@@ -191,41 +220,133 @@ def match_modules_set(
     For example, matching layer norms to their subsequent linear layers
     ```python3
     for norm, q, k, v in match_modules_set(model, (norm_tgt, q_tgt, k_tgt, v_tgt)):
-        fuse_norm_linears(norm, [q, k, v])
+        fuse_norm_linears(*norm, [*q, *k, *v])
+    ```
+
+    Alternatively for MoE you would get multiple matches
+    per target per group, E.g.
+
+    ```python3
+
+    targets = [
+        "post_attention_layernorm",
+        "up_proj",
+        "down_proj"
+    ]
+    match_modules_set(model, targets) == (
+        [
+            [layers.0.post_attention_layernorm],
+            [
+                `layers.0.mlp.experts.0.up_proj`,
+                `layers.0.mlp.experts.1.up_proj`,
+                ...
+            ],
+            [
+                `layers.0.mlp.experts.0.down_proj`,
+                `layers.0.mlp.experts.1.down_proj`,
+                ...
+
+            ]
+        ], # <- first yield
+        [
+            [layers.1.post_attention_layernorm],
+            [
+                `layers.1.mlp.experts.0.up_proj`,
+                `layers.1.mlp.experts.1.up_proj`,
+                ...
+            ],
+            [
+                `layers.1.mlp.experts.0.down_proj`,
+                `layers.1.mlp.experts.1.down_proj`,
+                ...
+            ]
+        ],
+        ...
+    )
+    ```
 
     :param model: model containing modules to match against
     :param targets: target strings, potentially containing "re:" prefixes
     :param ignore: targets to ignore, potentially containing "re:" prefixes
+    :param error_on_module_rematch: if True, errors when a module gets
+      matched to multiple targets, if False, no error. (Defaults to True)
     """
     targets = targets or []
     ignore = ignore or []
 
-    matches = dict.fromkeys(targets, None)
+    # as we iterate through modules and try to match them with targets,
+    # the algorithm can be in 2 possible states:
+    # 0) unmatched_targets > 0, i.e. some of the targets haven't been matched.
+    #   Keep matching until all targets have at least one match
+    # 1) unmatched_targets == 0 i.e. we have at least one match for each target.
+    #   At this point we are unsure if we have a full set or if we need to add
+    #   more matches.
+    # There are 3 things that can happen once were in state 1:
+    # A) found a new match with same parent_context,
+    #   (add it to matches and keep going)
+    # B) found a new match with different parent_context, i.e. we found a match
+    #   that requires a deeper parent context, this indicates that this match
+    #   should be part of a new set.
+    #   (yield current set [not including newest match] and go back to state 0)
+    # C) ran out of modules, we will always yield the final remaining set when
+    #   we we've iterated through all the modules in the model.
+    #   (yield final set then exit.)
+    # Note: its possible to iterate through all the modules in the model while
+    #   not having a full matched set if the user specified a bad matching, in
+    #   that case something has gone wrong and we error
+    matches = defaultdict(list)
+    parent_context = None
+    unmatched_targets = set(targets)
+
     for name, module in model.named_modules():
-        # match until we get a full set
+        matched_targets_for_cur_module = set()
         for target in targets:
             if is_match(name, module, target, ignore):
-                if matches[target] is not None:
-                    raise ValueError(f"Matched a {target} twice before completing set")
-                matches[target] = module
+                new_parent_context = get_lowest_common_ancestor_name(
+                    [name, parent_context]
+                )
 
-        # once we have a full set, yield and reset
-        if targets and all((matches[target] is not None for target in targets)):
-            yield [matches[target] for target in targets]  # ensure correct ordering
-            matches = dict.fromkeys(targets, None)
+                # code for (B)
+                if not unmatched_targets and new_parent_context != parent_context:
+                    yield [matches[target] for target in targets]
+                    matches = defaultdict(list)
+                    new_parent_context = name
+                    unmatched_targets = set(targets)
 
-    # check that none are left over
-    unmatched_keys = [match for match, value in matches.items() if value is not None]
-    if len(unmatched_keys):
-        raise ValueError(f"Unable to match targets into set: {unmatched_keys}")
+                matches[target].append(module)
+                parent_context = new_parent_context
+                unmatched_targets -= {target}
+                matched_targets_for_cur_module |= {target}
+
+        if len(matched_targets_for_cur_module) > 1 and error_on_module_rematch:
+            raise ValueError(
+                f"module: {name} was matched with multiple targets: "
+                f"{matched_targets_for_cur_module} which is unexpected "
+                "disable this check by setting `error_on_module_rematch = False`"
+            )
+
+    # never found anything
+    if unmatched_targets == set(targets):
+        return
+
+    # code for (C)
+    if not unmatched_targets:  # have a full matching
+        yield [matches[target] for target in targets]
+        return
+
+    raise ValueError(
+        f"Found a final incomplete set with matches found for keys: "
+        f"{set(targets) - unmatched_targets} "
+        f"but no matches found for keys: {unmatched_targets}"
+    )
 
 
 def is_match(
     name: str,
     module: torch.nn.Module,
-    targets: Union[str, Iterable[str]],
-    ignore: Union[str, Iterable[str]] = tuple(),
-    fused: Optional[FusedMappping] = None,
+    targets: str | Iterable[str],
+    ignore: str | Iterable[str] = tuple(),
+    fused: FusedMappping | None = None,
 ) -> bool:
     """
     Returns true if either module name or module parent classes match against target
@@ -251,16 +372,44 @@ def is_match(
 
     return not isinstance(module, InternalModule) and (
         any(
-            _match_name(name, target, fused) or _match_class(module, target)
+            match_name(name, target, fused) or _match_class(module, target)
             for target in targets
         )
         and not any(
-            _match_name(name, ign, fused) or _match_class(module, ign) for ign in ignore
+            match_name(name, ign, fused) or _match_class(module, ign) for ign in ignore
         )
     )
 
 
-def _match_name(name: str, target: str, fused: Optional[FusedMappping] = None) -> bool:
+def is_narrow_match(
+    model: torch.nn.Module,
+    targets: str | Iterable[str],
+    name: str,
+    module: torch.nn.Module | None = None,
+) -> bool:
+    """
+    Checks if any of the targets narrowly match the module. A target narrowly matches
+    a module if the target matches the module, but does not match the module's parent
+
+    :param model: model containing both module and its parent
+    :param targets: target strings, potentially containing "re:" prefixes
+    :param name: name of module to match
+    :param module: module to match. If none is provided, then get module from model
+    :return: True if any of the targets narrow match the module
+    """
+    targets = [targets] if isinstance(targets, str) else targets
+    module = module if module is not None else model.get_submodule(name)
+
+    parent_name = name.rsplit(".", 1)[0]
+    parent = model.get_submodule(parent_name)
+
+    return any(
+        is_match(name, module, target) and not is_match(parent_name, parent, target)
+        for target in targets
+    )
+
+
+def match_name(name: str, target: str, fused: FusedMappping | None = None) -> bool:
     """
     Returns true if target string begins with "re:" and regex matches or if target
     string exactly matches name. If the name refers to a fused module defined by vLLM,
@@ -276,7 +425,7 @@ def _match_name(name: str, target: str, fused: Optional[FusedMappping] = None) -
             if name.endswith(fused_suffix):
                 name_stripped = name.removesuffix(fused_suffix)
                 return any(
-                    _match_name(name_stripped + shard_suffix, target)
+                    match_name(name_stripped + shard_suffix, target)
                     for shard_suffix in fused[fused_suffix]
                 )
 
@@ -305,3 +454,60 @@ def _match_class(module: torch.nn.Module, target: str) -> bool:
         )
         for cls in module.__class__.__mro__
     )
+
+
+def match_quantizable_tensors(
+    tensors: Mapping[str, torch.Tensor],
+    ignore: Iterable[str],
+    targets: Iterable[str] = tuple(),
+    param_targets: Iterable[str] = ("weight",),
+    allow_nonquantizable: bool = False,
+) -> Iterator[tuple[str, str]]:
+    """
+    Match all quantizable tensors that are targeted and not ignored. Note that inputs
+        "targets" and "ignore" operate on module names, matching their usage elsewhere
+        in `compressed_tensors.utils.match`.
+
+    :param tensors: Mapping of name in safetensors file to actual tensor
+    :param ignore: ignore individual tensor if any match is found within elements in
+        ignore when compared to module name (regex allowed)
+    :param targets: include if any match is found within elements in targets when
+        compared to module name (regex allowed). Unlike model-based matching utils,
+        this only checks names, not classes. If empty or if "Linear" is included, assume
+        targets is all-inclusive.
+    :param param_targets: same as targets, but for param name instead of module name.
+        Useful when qparam names like "weight_scale", "weight_packed", etc. need to be
+        matched as well (regex allowed).
+    :param allow_nonquantizable: Override to include non-quantizable modules, like
+        layernorms. Note that this list must be kept up-to-date with naming conventions,
+        unless a more concrete check can be found without necessitating loading the
+        model up in transformers, or inspecting the model def code itself.
+
+    :return: iterator of module_name and full tensor name meeting filtering
+        criterion.
+    """
+    for name in list(tensors.keys()):
+        module_name, _, param_name = name.rpartition(".")
+
+        if not allow_nonquantizable and module_name.endswith("norm"):
+            continue
+
+        is_param_targeted = any(
+            (match_name(param_name, target)) for target in param_targets
+        )
+        if not is_param_targeted:
+            continue
+
+        is_module_targeted = (
+            len(targets) == 0
+            or "Linear" in targets
+            or any((match_name(module_name, target)) for target in targets)
+        )
+        if not is_module_targeted:
+            continue
+
+        is_module_ignored = any(match_name(module_name, ign) for ign in ignore)
+        if is_module_ignored:
+            continue
+
+        yield module_name, name

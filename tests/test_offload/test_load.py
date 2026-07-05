@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+import torch
+from compressed_tensors.offload import (
+    disable_onloading,
+    from_accelerate,
+    get_offloaded_device,
+)
+from compressed_tensors.offload.convert import to_accelerate
+from compressed_tensors.offload.convert.from_accelerate import _infer_module_device
+from compressed_tensors.offload.load import load_offloaded_model
+from tests.test_offload.conftest import (
+    assert_device_equal,
+    skip_if_mps_device,
+    torchrun,
+)
+from tests.testing_utils import requires_gpu
+from transformers import AutoModelForCausalLM
+
+
+acclerate = pytest.importorskip("accelerate")
+
+
+accelerator_device = torch.accelerator.current_accelerator()
+TEST_PARAMETERS = [
+    (
+        "auto",
+        {0: 596049920, "cpu": 1e15},  # force cpu offload for testing
+        accelerator_device,
+        torch.device("cpu"),
+    ),
+    (
+        accelerator_device.type,
+        None,
+        accelerator_device,
+        accelerator_device,
+    ),
+    (
+        "cpu",
+        None,
+        torch.device("cpu"),
+        torch.device("cpu"),
+    ),
+    (
+        "auto_offload",
+        {"cpu": 596049920},  # force disk offload for testing
+        torch.device("cpu"),
+        "disk",
+    ),
+]
+
+
+@pytest.mark.integration
+@requires_gpu
+@pytest.mark.parametrize("device_map,max_memory,first,second", TEST_PARAMETERS)
+def test_load(device_map, max_memory, first, second, tmp_path):
+    with load_offloaded_model(AutoModelForCausalLM):
+        model = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen3-0.6B",
+            device_map=device_map,
+            max_memory=max_memory,
+            dtype=torch.bfloat16,
+            offload_folder=str(tmp_path / "disk_offload"),
+        )
+
+    for layer_index in range(0, 8):
+        module = model.get_submodule(f"model.layers.{layer_index}.self_attn.q_proj")
+        assert_device_equal(get_offloaded_device(module), first)
+
+    for layer_index in range(8, 28):
+        module = model.get_submodule(f"model.layers.{layer_index}.self_attn.q_proj")
+        assert_device_equal(get_offloaded_device(module), second)
+
+    with disable_onloading():
+        state_dict = model.state_dict(keep_vars=True)
+
+    to_accelerate(model)
+
+    for layer_index in range(0, 8):
+        module = model.get_submodule(f"model.layers.{layer_index}.self_attn.q_proj")
+        assert_device_equal(_get_accelerate_offloaded_device(module), first)
+
+    for layer_index in range(8, 28):
+        module = model.get_submodule(f"model.layers.{layer_index}.self_attn.q_proj")
+        assert_device_equal(_get_accelerate_offloaded_device(module), second)
+
+    model.save_pretrained(tmp_path / "save_path")
+
+    from_accelerate(model)
+
+    # TODO: accelerate's disk onloading implementation does not keep consistent meta
+    # tensors, :. tensor pointers change and cannot be converted back properly
+    if second != "disk":
+        with disable_onloading():
+            assert model.state_dict(keep_vars=True) == state_dict
+
+
+@pytest.mark.integration
+@requires_gpu(2)
+@torchrun(world_size=2, init_dist=True)
+def test_load_dist(tmp_path):
+    for parameters in TEST_PARAMETERS:
+        test_load(*parameters, tmp_path=tmp_path)
+
+
+def _get_accelerate_offloaded_device(module: torch.nn.Module) -> str | None:
+    device = _infer_module_device(module)
+    if device == torch.device("meta"):
+        return "disk"
+
+    return device
+
+
+@pytest.mark.unit
+@skip_if_mps_device
+@patch("compressed_tensors.offload.load.from_accelerate")
+def test_patch_forwards_positional_args(mock_from_accelerate):
+    """Regression: positional args must be forwarded without rebinding to cls."""
+    received = {}
+
+    class FakeModel:
+        @classmethod
+        def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+            received["cls"] = cls
+            received["path"] = pretrained_model_name_or_path
+            received["model_args"] = model_args
+            received["kwargs"] = kwargs
+            return MagicMock()
+
+    with load_offloaded_model(FakeModel, extra_cpu_mem=0):
+        FakeModel.from_pretrained("org/model", device_map="cpu", torch_dtype="auto")
+
+    assert received["cls"] is FakeModel
+    assert received["path"] == "org/model"
+    assert received["kwargs"]["device_map"] == "cpu"
+    assert received["kwargs"]["torch_dtype"] == "auto"

@@ -1,5 +1,4 @@
 .PHONY: build docs test
-
 BUILD_TYPE ?= dev # set nightly to build nightly release
 PYCHECKDIRS := src tests
 PYCHECKGLOBS := 'src/**/*.py' 'tests/**/*.py' 'utils/**/*.py' 'examples/**/*.py' setup.py
@@ -8,22 +7,28 @@ quality:
 	@echo "Running copyright checks";
 	python utils/copyright.py quality $(PYCHECKGLOBS)
 	@echo "Running python quality checks";
-	black --check $(PYCHECKDIRS);
+	black --target-version py310 --check $(PYCHECKDIRS);
 	isort --check-only $(PYCHECKDIRS);
 	flake8 $(PYCHECKDIRS);
 
 # style the code according to accepted standards for the repo
 style:
-	@echo "Running copyright style";
+	@echo "Running copyright checks";
 	python utils/copyright.py style $(PYCHECKGLOBS)
 	@echo "Running python styling";
-	black $(PYCHECKDIRS);
+	black --target-version py310 $(PYCHECKDIRS);
 	isort $(PYCHECKDIRS);
 
 # run tests for the repo
 test:
 	@echo "Running python tests";
-	pytest tests;
+	pytest -ra tests;
+
+# run xpu tests for the repo
+test-xpu: 
+	@echo "Running xpu tests"
+	pytest -c pytest-xpu.ini;
+
 
 # creates wheel file
 build:
