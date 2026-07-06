@@ -69,6 +69,17 @@ def test_block_structure_string_non_int():
         QuantizationArgs(strategy="block", block_structure="2xfoo")
 
 
+def test_block_structure_requires_positive_dims():
+    with pytest.raises(ValidationError):
+        QuantizationArgs(strategy="block", block_structure=[0, 4])
+    with pytest.raises(ValidationError):
+        QuantizationArgs(strategy="block", block_structure=[-1, 4])
+    with pytest.raises(ValidationError):
+        QuantizationArgs(strategy="block", block_structure="0x4")
+    with pytest.raises(ValidationError):
+        QuantizationArgs(strategy="block", block_structure="-1x4")
+
+
 def test_infer_strategy():
     args = QuantizationArgs(group_size=128)
     assert args.strategy == QuantizationStrategy.GROUP
